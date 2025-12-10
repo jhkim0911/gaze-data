@@ -134,7 +134,7 @@ class Sam3PersonDetector:
         response = self._predictor.add_prompt(
             session_id=self._session_id,
             frame_idx=frame_index,
-            text="face",
+            text="people",
         )
         return response.get("outputs", {})
     
