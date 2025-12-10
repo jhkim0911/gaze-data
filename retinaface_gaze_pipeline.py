@@ -43,9 +43,11 @@ class FaceDetection:
 class TrackedFace:
     """Tracked face result from SAM3."""
     face_id: int
-    bbox: Tuple[float, float, float, float]  # (x1, y1, x2, y2) normalized
-    bbox_px: Tuple[int, int, int, int]  # (x1, y1, x2, y2) pixels
+    bbox: Tuple[float, float, float, float]  # (x1, y1, x2, y2) normalized - from SAM3 mask
+    bbox_px: Tuple[int, int, int, int]  # (x1, y1, x2, y2) pixels - from SAM3 mask
     score: float
+    retinaface_bbox_px: Optional[Tuple[int, int, int, int]] = None  # Original RetinaFace bbox
+    retinaface_bbox: Optional[Tuple[float, float, float, float]] = None  # Original RetinaFace bbox normalized
     mask: Optional[np.ndarray] = None
 
 
@@ -161,52 +163,62 @@ class RetinaFaceDetector:
 
 
 # ============================================================================
-# SAM3 Bounding Box Tracker
+# SAM3 Bounding Box Tracker (HuggingFace Transformers API)
 # ============================================================================
 
 class Sam3BboxTracker:
     """
     SAM3 video tracker using bounding box prompts.
     
-    Uses face bboxes from RetinaFace as prompts to track each person
-    through the video.
+    Uses HuggingFace Transformers Sam3TrackerVideoModel/Processor which supports
+    multi-object tracking with points or boxes.
     """
     
     def __init__(self, device: str = "cuda"):
         """
-        Initialize SAM3 video tracker.
+        Initialize SAM3 tracker.
         
         Args:
             device: Device for inference
         """
         self.device = device
-        self._predictor = None
-        self._session_id = None
+        self._model = None
+        self._processor = None
+        self._inference_session = None
     
     def _ensure_loaded(self):
-        """Lazy-load SAM3 video predictor."""
-        if self._predictor is None:
+        """Lazy-load SAM3 tracker via HuggingFace Transformers."""
+        if self._model is None:
             try:
-                from sam3.model_builder import build_sam3_video_predictor
-                self._predictor = build_sam3_video_predictor()
-                print("SAM3 video predictor loaded successfully")
+                from transformers import Sam3TrackerVideoModel, Sam3TrackerVideoProcessor
+                import torch
+                
+                self._model = Sam3TrackerVideoModel.from_pretrained("facebook/sam3")
+                self._model = self._model.to(self.device, dtype=torch.bfloat16)
+                self._processor = Sam3TrackerVideoProcessor.from_pretrained("facebook/sam3")
+                
+                print("SAM3 tracker (HuggingFace Transformers) loaded successfully")
             except ImportError as e:
                 raise ImportError(
-                    "SAM3 not installed. Please install from: "
-                    "git clone https://github.com/facebookresearch/sam3.git && "
-                    "cd sam3 && pip install -e '.[notebooks]'"
+                    "transformers package doesn't have Sam3TrackerVideoModel. "
+                    "Try: pip install --upgrade transformers"
                 ) from e
     
-    def start_session(self, video_path: str) -> str:
-        """Start a video tracking session."""
-        self._ensure_loaded()
+    def init_session(self, video_frames: List[np.ndarray]) -> None:
+        """
+        Initialize inference session with video frames.
         
-        response = self._predictor.start_session(
-            resource_path=video_path,
-            session_id=None,
+        Args:
+            video_frames: List of RGB frames as numpy arrays
+        """
+        self._ensure_loaded()
+        import torch
+        
+        self._inference_session = self._processor.init_video_session(
+            video=video_frames,
+            inference_device=self.device,
+            dtype=torch.bfloat16,
         )
-        self._session_id = response["session_id"]
-        return self._session_id
     
     def add_face_prompts(
         self, 
@@ -217,34 +229,47 @@ class Sam3BboxTracker:
         """
         Add face bounding boxes as tracking prompts.
         
+        Uses actual bounding boxes from RetinaFace to prompt SAM3 to track faces
+        (not whole persons).
+        
         Args:
             face_detections: List of face detections from RetinaFace
             frame_idx: Frame index where faces were detected
             video_size: (width, height) of the video
         """
-        if self._session_id is None:
-            raise RuntimeError("No active session. Call start_session() first.")
+        if self._inference_session is None:
+            raise RuntimeError("No active session. Call init_session() first.")
+        
+        if len(face_detections) == 0:
+            return
+        
+        # Store face detections for later retrieval during tracking
+        self._face_detections = {face.face_id: face for face in face_detections}
+        
+        # Build bounding boxes for all faces
+        obj_ids = [face.face_id for face in face_detections]
+        
+        # Input boxes format: [[[x1, y1, x2, y2], [x1, y1, x2, y2], ...]] - 3 levels: image, box, coords
+        input_boxes = [[]]
         
         for face in face_detections:
-            # Convert normalized xyxy to normalized xywh for SAM3
-            x1, y1, x2, y2 = face.bbox
-            x = x1
-            y = y1
-            w = x2 - x1
-            h = y2 - y1
-            
-            # SAM3 expects boxes_xywh in normalized format
-            bbox_xywh = [[x, y, w, h]]
-            
-            # Add prompt for this face
-            self._predictor.add_prompt(
-                session_id=self._session_id,
-                frame_idx=frame_idx,
-                bounding_boxes=bbox_xywh,
-                bounding_box_labels=[1],  # Positive label
-                obj_id=face.face_id,
-            )
-    
+            x1, y1, x2, y2 = face.bbox_px
+            input_boxes[0].append([x1, y1, x2, y2])
+        
+        # Add all object prompts using bounding boxes
+        self._processor.add_inputs_to_inference_session(
+            inference_session=self._inference_session,
+            frame_idx=frame_idx,
+            obj_ids=obj_ids,
+            input_boxes=input_boxes,
+        )
+        
+        # Run inference on the first frame (required before propagation)
+        outputs = self._model(
+            inference_session=self._inference_session,
+            frame_idx=frame_idx,
+        )
+
     def propagate_tracking(
         self, 
         max_frames: Optional[int] = None
@@ -255,71 +280,71 @@ class Sam3BboxTracker:
         Returns:
             Dict mapping frame_idx to list of TrackedFace
         """
-        if self._session_id is None:
-            raise RuntimeError("No active session. Call start_session() first.")
+        if self._inference_session is None:
+            raise RuntimeError("No active session. Call init_session() first.")
         
         results = {}
         
-        # Use handle_stream_request for propagate_in_video
-        request = dict(
-            type="propagate_in_video",
-            session_id=self._session_id,
-            propagation_direction="forward",
-            start_frame_index=0,
-            max_frame_num_to_track=max_frames if max_frames else None,
-        )
+        video_height = self._inference_session.video_height
+        video_width = self._inference_session.video_width
         
-        propagation = self._predictor.handle_stream_request(request=request)
-        
-        for frame_output in propagation:
-            frame_idx = frame_output["frame_index"]
-            outputs = frame_output["outputs"]
+        # Propagate through video
+        for sam3_output in self._model.propagate_in_video_iterator(self._inference_session):
+            frame_idx = sam3_output.frame_idx
             
-            if outputs is None:
-                continue
+            # Get masks at original resolution
+            video_res_masks = self._processor.post_process_masks(
+                [sam3_output.pred_masks], 
+                original_sizes=[[video_height, video_width]], 
+                binarize=True
+            )[0]
             
             tracked_faces = []
-            
-            # SAM3 video predictor returns:
-            # - out_obj_ids: numpy array of object IDs
-            # - out_probs: numpy array of detection scores  
-            # - out_boxes_xywh: numpy array of boxes in (x, y, w, h) normalized format
-            # - out_binary_masks: numpy array of binary masks
-            obj_ids = outputs.get("out_obj_ids", [])
-            scores = outputs.get("out_probs", [])
-            boxes_xywh = outputs.get("out_boxes_xywh", [])
-            masks = outputs.get("out_binary_masks", None)
+            obj_ids = self._inference_session.obj_ids
             
             for i, obj_id in enumerate(obj_ids):
-                score = scores[i] if i < len(scores) else 1.0
+                mask = video_res_masks[i].cpu().numpy().squeeze()
                 
-                # Convert xywh (normalized) to xyxy (normalized)
-                # SAM3 returns (x, y, w, h) where x,y is TOP-LEFT corner
-                if i < len(boxes_xywh):
-                    x, y, w, h = boxes_xywh[i]
-                    x1, y1 = x, y
-                    x2, y2 = x + w, y + h
-                    bbox_norm = (x1, y1, x2, y2)
-                else:
-                    bbox_norm = (0, 0, 0, 0)
-                
-                tracked_faces.append(TrackedFace(
-                    face_id=int(obj_id),
-                    bbox=bbox_norm,
-                    bbox_px=(0, 0, 0, 0),  # Will compute later
-                    score=float(score),
-                    mask=masks[i] if masks is not None and i < len(masks) else None,
-                ))
+                # Get bbox from mask
+                if mask.any():
+                    ys, xs = np.where(mask > 0.5)
+                    if len(xs) > 0 and len(ys) > 0:
+                        x1, x2 = xs.min(), xs.max()
+                        y1, y2 = ys.min(), ys.max()
+                        
+                        bbox_px = (int(x1), int(y1), int(x2), int(y2))
+                        bbox_norm = (
+                            x1 / video_width,
+                            y1 / video_height,
+                            x2 / video_width,
+                            y2 / video_height,
+                        )
+                        
+                        # Get original RetinaFace bbox if available
+                        orig_face = self._face_detections.get(int(obj_id)) if hasattr(self, '_face_detections') else None
+                        
+                        tracked_faces.append(TrackedFace(
+                            face_id=int(obj_id),
+                            bbox=bbox_norm,
+                            bbox_px=bbox_px,
+                            score=1.0,
+                            retinaface_bbox_px=orig_face.bbox_px if orig_face else None,
+                            retinaface_bbox=orig_face.bbox if orig_face else None,
+                            mask=mask,
+                        ))
             
             results[frame_idx] = tracked_faces
+            
+            if max_frames and len(results) >= max_frames:
+                break
         
         return results
     
-    def close_session(self):
-        """Close the current session."""
-        if self._session_id is not None and self._predictor is not None:
-            self._predictor.close_session(session_id=self._session_id)
-            self._session_id = None
+    def reset_state(self):
+        """Reset the inference session."""
+        if self._inference_session is not None:
+            self._inference_session.reset_inference_session()
+        self._inference_session = None
     
     def process_video(
         self,
@@ -341,41 +366,45 @@ class Sam3BboxTracker:
                 - Video size (width, height)
                 - Video FPS
         """
-        # Get video metadata
+        # Load video frames
         cap = cv2.VideoCapture(video_path)
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        # Read all frames
+        frames = []
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            # Convert BGR to RGB
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames.append(frame_rgb)
+            if max_frames and len(frames) >= max_frames:
+                break
         cap.release()
         
+        print(f"Loaded {len(frames)} frames")
+        
         try:
-            # Start session
-            self.start_session(video_path)
+            # Initialize session with video frames
+            self.init_session(frames)
             
             # Add face prompts from first frame
             print(f"Adding {len(face_detections)} face prompts...")
             self.add_face_prompts(face_detections, frame_idx=0, video_size=(width, height))
             
             # Propagate through video
-            print(f"Tracking faces through video ({total_frames} frames)...")
+            print(f"Tracking faces through video ({len(frames)} frames)...")
             tracked_faces = self.propagate_tracking(max_frames=max_frames)
-            
-            # Convert normalized bboxes to pixel coordinates
-            for frame_idx, faces in tracked_faces.items():
-                for face in faces:
-                    x1, y1, x2, y2 = face.bbox
-                    face.bbox_px = (
-                        int(x1 * width),
-                        int(y1 * height),
-                        int(x2 * width),
-                        int(y2 * height),
-                    )
             
             return tracked_faces, (width, height), fps
             
         finally:
-            self.close_session()
+            self.reset_state()
+
 
 
 # ============================================================================
@@ -541,8 +570,10 @@ class RetinaFaceGazeAnnotator:
                 # Store result
                 person_data = {
                     "person_id": face.face_id,
-                    "face_bbox": face.bbox,
-                    "face_bbox_px": face.bbox_px,
+                    "face_bbox": face.bbox,  # SAM3 tracked bbox (changes per frame)
+                    "face_bbox_px": face.bbox_px,  # SAM3 tracked bbox in pixels
+                    "retinaface_bbox": face.retinaface_bbox,  # Original RetinaFace detection (constant)
+                    "retinaface_bbox_px": face.retinaface_bbox_px,  # Original RetinaFace detection in pixels
                     "detection_score": float(face.score),
                     "head_bbox": gaze_result["head_bbox"],
                     "head_bbox_px": gaze_result["head_bbox_px"],
@@ -597,6 +628,9 @@ class RetinaFaceGazeAnnotator:
         """Save annotation results to JSON file."""
         class NumpyEncoder(json.JSONEncoder):
             def default(self, obj):
+                import torch
+                if isinstance(obj, torch.Tensor):
+                    return obj.cpu().numpy().tolist()
                 if isinstance(obj, np.floating):
                     return float(obj)
                 if isinstance(obj, np.integer):
@@ -619,7 +653,8 @@ def visualize_annotations(
     video_path: str,
     results: Dict,
     output_path: str,
-    show_face_bbox: bool = True,
+    show_face_bbox: bool = True,  # SAM3 tracked bbox
+    show_retinaface_bbox: bool = True,  # Original RetinaFace detection bbox
     show_head_bbox: bool = True,
     show_gaze: bool = True,
     progress_bar: bool = True,
@@ -637,7 +672,7 @@ def visualize_annotations(
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
     
-    # Color palette
+    # Color palette for per-person elements
     colors = [
         (0, 255, 0),    # Green
         (255, 128, 0),  # Blue-ish
@@ -649,6 +684,7 @@ def visualize_annotations(
         (255, 0, 128),  # Pink
     ]
     out_color = (0, 0, 255)  # Red for "OUT"
+    retinaface_color = (255, 0, 200)  # Magenta/Hot Pink for RetinaFace bbox
     
     pbar = tqdm(results["frames"], desc="Creating visualization", disable=not progress_bar)
     
@@ -665,13 +701,24 @@ def visualize_annotations(
             color = colors[person_id % len(colors)]
             inout = person["inout"]
             
-            # Draw face bbox
+            # Draw RetinaFace detection bbox (magenta, constant across frames)
+            if show_retinaface_bbox and person.get("retinaface_bbox_px"):
+                rx1, ry1, rx2, ry2 = person["retinaface_bbox_px"]
+                cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), retinaface_color, 2, cv2.LINE_AA)
+                
+                # Small label
+                label = f"RF{person_id}"
+                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                cv2.rectangle(frame, (rx1, ry2), (rx1 + tw + 4, ry2 + th + 6), retinaface_color, -1)
+                cv2.putText(frame, label, (rx1 + 2, ry2 + th + 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+            
+            # Draw SAM3 tracked face bbox (per-person color, changes per frame)
             if show_face_bbox:
                 x1, y1, x2, y2 = person["face_bbox_px"]
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
                 
                 # Label with colored background
-                label = f"Face {person_id}"
+                label = f"SAM{person_id}"
                 (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
                 cv2.rectangle(frame, (x1, y1 - th - 8), (x1 + tw + 4, y1), color, -1)
                 cv2.putText(frame, label, (x1 + 2, y1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
