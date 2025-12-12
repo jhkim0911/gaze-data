@@ -1,0 +1,870 @@
+#!/usr/bin/env python3
+"""
+SAM3 Person Tracking + RetinaFace Per-Frame + GazeAnywhere Pipeline
+
+This hybrid pipeline combines:
+1. SAM3 with text prompt "people" for consistent person ID tracking
+2. RetinaFace per-frame for accurate face detection
+3. GazeAnywhere per-frame for high-quality gaze estimation
+
+This gives the best of both worlds:
+- Consistent person IDs from SAM3 tracking (even when faces are temporarily occluded)
+- High-quality gaze estimation from per-frame face detection
+
+Usage:
+    python sam3_retinaface_gaze_pipeline.py --video_path /path/to/video.mp4
+"""
+
+import argparse
+import json
+import os
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import cv2
+import numpy as np
+import torch
+from PIL import Image
+from tqdm import tqdm
+
+# ============================================================================
+# Data Classes
+# ============================================================================
+
+@dataclass
+class PersonTrack:
+    """Person tracking result from SAM3."""
+    person_id: int
+    bbox: Tuple[float, float, float, float]  # (x1, y1, x2, y2) normalized
+    bbox_px: Tuple[int, int, int, int]  # (x1, y1, x2, y2) pixels
+    score: float
+    mask: Optional[np.ndarray] = None
+
+
+@dataclass
+class FaceDetection:
+    """Face detection result from RetinaFace."""
+    bbox: Tuple[float, float, float, float]  # (x1, y1, x2, y2) normalized
+    bbox_px: Tuple[int, int, int, int]  # (x1, y1, x2, y2) pixels
+    score: float
+    landmarks: Optional[np.ndarray] = None
+
+
+@dataclass
+class PersonGazeResult:
+    """Combined person tracking + gaze result."""
+    person_id: int
+    # From SAM3
+    body_bbox: Tuple[float, float, float, float]
+    body_bbox_px: Tuple[int, int, int, int]
+    # From RetinaFace
+    face_bbox: Optional[Tuple[float, float, float, float]]
+    face_bbox_px: Optional[Tuple[int, int, int, int]]
+    # From GazeAnywhere
+    head_bbox: Optional[Tuple[float, float, float, float]]
+    head_bbox_px: Optional[Tuple[float, float, float, float]]
+    gaze_point: Optional[Tuple[float, float]]
+    gaze_point_px: Optional[Tuple[float, float]]
+    inout: Optional[bool]
+    # Metadata
+    face_detected: bool  # Whether face was found within person bbox
+
+
+# ============================================================================
+# SAM3 Person Tracker (Video Predictor)
+# ============================================================================
+
+class Sam3PersonTracker:
+    """
+    SAM3 video predictor for person tracking.
+    
+    Uses text prompt "people" to detect and track all persons with consistent IDs.
+    """
+    
+    def __init__(self, device: str = "cuda", confidence_threshold: float = 0.5):
+        self.device = device
+        self.confidence_threshold = confidence_threshold
+        self._predictor = None
+        self._session_id = None
+    
+    def _ensure_loaded(self):
+        """Lazy-load SAM3 video predictor."""
+        if self._predictor is None:
+            try:
+                from sam3.model_builder import build_sam3_video_predictor
+                self._predictor = build_sam3_video_predictor()
+                print("SAM3 video predictor loaded successfully")
+            except ImportError as e:
+                raise ImportError(
+                    "SAM3 not installed. Install from: "
+                    "git clone https://github.com/facebookresearch/sam3.git && "
+                    "cd sam3 && pip install -e '.[notebooks]'"
+                ) from e
+    
+    def start_session(self, video_path: str) -> str:
+        """Start a video processing session."""
+        self._ensure_loaded()
+        response = self._predictor.start_session(
+            resource_path=video_path,
+            session_id=None,
+        )
+        self._session_id = response["session_id"]
+        return self._session_id
+    
+    def detect_persons(self, frame_index: int = 0) -> Dict:
+        """Add 'people' text prompt for initial detection."""
+        if self._session_id is None:
+            raise RuntimeError("No active session. Call start_session() first.")
+        
+        response = self._predictor.add_prompt(
+            session_id=self._session_id,
+            frame_idx=frame_index,
+            text="people",
+        )
+        return response.get("outputs", {})
+    
+    def propagate_tracking(
+        self, 
+        max_frames: Optional[int] = None
+    ) -> Dict[int, List[PersonTrack]]:
+        """Propagate person tracking through video."""
+        if self._session_id is None:
+            raise RuntimeError("No active session. Call start_session() first.")
+        
+        results = {}
+        
+        request = dict(
+            type="propagate_in_video",
+            session_id=self._session_id,
+            propagation_direction="forward",
+            start_frame_index=0,
+            max_frame_num_to_track=max_frames if max_frames else None,
+        )
+        
+        propagation = self._predictor.handle_stream_request(request=request)
+        
+        for frame_output in propagation:
+            frame_idx = frame_output["frame_index"]
+            outputs = frame_output["outputs"]
+            
+            if outputs is None:
+                continue
+            
+            tracks = []
+            obj_ids = outputs.get("out_obj_ids", [])
+            scores = outputs.get("out_probs", [])
+            boxes_xywh = outputs.get("out_boxes_xywh", [])
+            masks = outputs.get("out_binary_masks", None)
+            
+            for i, obj_id in enumerate(obj_ids):
+                score = scores[i] if i < len(scores) else 1.0
+                if score >= self.confidence_threshold:
+                    if i < len(boxes_xywh):
+                        x, y, w, h = boxes_xywh[i]
+                        x1, y1 = x, y
+                        x2, y2 = x + w, y + h
+                        box_norm = (x1, y1, x2, y2)
+                    else:
+                        box_norm = (0, 0, 0, 0)
+                    
+                    tracks.append(PersonTrack(
+                        person_id=int(obj_id),
+                        bbox=box_norm,
+                        bbox_px=(0, 0, 0, 0),  # Will compute later
+                        score=float(score),
+                        mask=masks[i] if masks is not None and i < len(masks) else None
+                    ))
+            
+            results[frame_idx] = tracks
+        
+        return results
+    
+    def end_session(self):
+        """End the current session."""
+        if self._session_id is not None and self._predictor is not None:
+            self._predictor.close_session(session_id=self._session_id)
+            self._session_id = None
+    
+    def process_video(
+        self,
+        video_path: str,
+        max_frames: Optional[int] = None,
+    ) -> Tuple[Dict[int, List[PersonTrack]], Tuple[int, int], float]:
+        """
+        Full video processing: detect and track all persons.
+        
+        Returns:
+            Tuple of:
+                - Dict mapping frame_idx to list of PersonTrack
+                - Video size (width, height)
+                - Video FPS
+        """
+        # Get video metadata
+        cap = cv2.VideoCapture(video_path)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        
+        try:
+            print(f"Starting SAM3 person tracking ({total_frames} frames)...")
+            self.start_session(video_path)
+            
+            print("Detecting persons with text prompt 'people'...")
+            self.detect_persons(frame_index=0)
+            
+            print("Propagating tracking through video...")
+            tracks = self.propagate_tracking(max_frames=max_frames)
+            
+            # Convert normalized bboxes to pixel coordinates
+            for frame_idx, persons in tracks.items():
+                for person in persons:
+                    x1, y1, x2, y2 = person.bbox
+                    person.bbox_px = (
+                        int(x1 * width),
+                        int(y1 * height),
+                        int(x2 * width),
+                        int(y2 * height),
+                    )
+            
+            return tracks, (width, height), fps
+        
+        finally:
+            self.end_session()
+
+
+# ============================================================================
+# RetinaFace Detector
+# ============================================================================
+
+class RetinaFaceDetector:
+    """Face detector using InsightFace's RetinaFace model."""
+    
+    def __init__(self, device: str = "cuda", det_thresh: float = 0.5):
+        self.device = device
+        self.det_thresh = det_thresh
+        self._app = None
+    
+    def _ensure_loaded(self):
+        """Lazy-load InsightFace model."""
+        if self._app is None:
+            try:
+                from insightface.app import FaceAnalysis
+                
+                providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if self.device == "cuda" else ['CPUExecutionProvider']
+                
+                self._app = FaceAnalysis(
+                    name='buffalo_l',
+                    providers=providers
+                )
+                self._app.prepare(ctx_id=0 if self.device == "cuda" else -1, det_thresh=self.det_thresh)
+                print("RetinaFace detector loaded successfully")
+                
+            except ImportError as e:
+                raise ImportError(
+                    "InsightFace not installed. Install: pip install insightface onnxruntime-gpu"
+                ) from e
+    
+    def detect_faces(self, frame_bgr: np.ndarray) -> List[FaceDetection]:
+        """Detect all faces in a frame."""
+        self._ensure_loaded()
+        
+        height, width = frame_bgr.shape[:2]
+        faces = self._app.get(frame_bgr)
+        
+        detections = []
+        for face in faces:
+            x1, y1, x2, y2 = face.bbox
+            
+            bbox_norm = (
+                float(x1) / width,
+                float(y1) / height,
+                float(x2) / width,
+                float(y2) / height,
+            )
+            bbox_px = (int(x1), int(y1), int(x2), int(y2))
+            
+            detections.append(FaceDetection(
+                bbox=bbox_norm,
+                bbox_px=bbox_px,
+                score=float(face.det_score),
+                landmarks=face.kps if hasattr(face, 'kps') else None,
+            ))
+        
+        return detections
+
+
+# ============================================================================
+# Face-to-Person Matcher
+# ============================================================================
+
+def compute_iou(box1: Tuple[int, int, int, int], box2: Tuple[int, int, int, int]) -> float:
+    """Compute IoU between two bounding boxes (pixel coordinates)."""
+    x1_1, y1_1, x2_1, y2_1 = box1
+    x1_2, y1_2, x2_2, y2_2 = box2
+    
+    xi1 = max(x1_1, x1_2)
+    yi1 = max(y1_1, y1_2)
+    xi2 = min(x2_1, x2_2)
+    yi2 = min(y2_1, y2_2)
+    
+    if xi2 <= xi1 or yi2 <= yi1:
+        return 0.0
+    
+    inter_area = (xi2 - xi1) * (yi2 - yi1)
+    box1_area = (x2_1 - x1_1) * (y2_1 - y1_1)
+    box2_area = (x2_2 - x1_2) * (y2_2 - y1_2)
+    union_area = box1_area + box2_area - inter_area
+    
+    if union_area <= 0:
+        return 0.0
+    
+    return inter_area / union_area
+
+
+def is_face_in_person(face_bbox_px: Tuple[int, int, int, int], person_bbox_px: Tuple[int, int, int, int]) -> bool:
+    """Check if face center is within person bbox."""
+    fx1, fy1, fx2, fy2 = face_bbox_px
+    px1, py1, px2, py2 = person_bbox_px
+    
+    face_cx = (fx1 + fx2) / 2
+    face_cy = (fy1 + fy2) / 2
+    
+    return px1 <= face_cx <= px2 and py1 <= face_cy <= py2
+
+
+def match_faces_to_persons(
+    face_detections: List[FaceDetection],
+    person_tracks: List[PersonTrack],
+    min_iou: float = 0.0
+) -> Dict[int, Optional[FaceDetection]]:
+    """
+    Match detected faces to tracked persons.
+    
+    Returns:
+        Dict mapping person_id to matched FaceDetection (or None if no face found)
+    """
+    matches: Dict[int, Optional[FaceDetection]] = {p.person_id: None for p in person_tracks}
+    used_faces: set = set()
+    
+    # For each person, find the best matching face
+    for person in person_tracks:
+        best_face = None
+        best_score = -1
+        
+        for i, face in enumerate(face_detections):
+            if i in used_faces:
+                continue
+            
+            # Check if face is within person bbox
+            if is_face_in_person(face.bbox_px, person.bbox_px):
+                # Use IoU as score if boxes overlap, else use containment
+                iou = compute_iou(face.bbox_px, person.bbox_px)
+                if iou >= min_iou:
+                    # Prefer higher detection score
+                    if face.score > best_score:
+                        best_score = face.score
+                        best_face = (i, face)
+        
+        if best_face is not None:
+            used_faces.add(best_face[0])
+            matches[person.person_id] = best_face[1]
+    
+    return matches
+
+
+# ============================================================================
+# GazeAnywhere Predictor
+# ============================================================================
+
+class GazePredictor:
+    """Wrapper for GazeAnywhere model."""
+    
+    def __init__(
+        self, 
+        checkpoint_path: str = "/projects/illinois/eng/cs/jrehg/users/xucao2/ChildGaze/checkpoints/GazeAnywhere/gazeanywhere.pth",
+        device: str = "cuda"
+    ):
+        self.device = device
+        self.checkpoint_path = checkpoint_path
+        self._predictor = None
+    
+    def _ensure_loaded(self):
+        if self._predictor is None:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from gaze_anywhere.inference import GazePredictor as _GazePredictor
+            self._predictor = _GazePredictor(
+                checkpoint_path=self.checkpoint_path,
+                device=self.device,
+            )
+            print("GazeAnywhere model loaded successfully")
+    
+    def predict(self, frame_rgb: np.ndarray, position_prompt: str) -> dict:
+        """Predict gaze for a person given their position."""
+        self._ensure_loaded()
+        return self._predictor.predict(frame_rgb, position_prompt)
+    
+    @staticmethod
+    def format_position_prompt(bbox_norm: Tuple[float, float, float, float]) -> str:
+        """Format a bounding box as a position prompt."""
+        x1, y1, x2, y2 = bbox_norm
+        cx = (x1 + x2) / 2
+        cy = (y1 + y2) / 2
+        return f"position: [{cx:.4f}, {cy:.4f}]"
+
+
+# ============================================================================
+# Full Pipeline Annotator
+# ============================================================================
+
+class Sam3RetinaFaceGazeAnnotator:
+    """
+    Hybrid pipeline: SAM3 tracking → RetinaFace per-frame → GazeAnywhere
+    
+    Phase 1: Run SAM3 to track all persons with consistent IDs
+    Phase 2: For each frame, detect faces with RetinaFace and match to persons
+    Phase 3: For each matched face, estimate gaze with GazeAnywhere
+    """
+    
+    def __init__(
+        self,
+        device: str = "cuda",
+        gaze_checkpoint: str = "/projects/illinois/eng/cs/jrehg/users/xucao2/ChildGaze/checkpoints/GazeAnywhere/gazeanywhere.pth",
+        sam3_confidence: float = 0.5,
+        face_det_thresh: float = 0.5,
+    ):
+        self.device = device
+        self.person_tracker = Sam3PersonTracker(device=device, confidence_threshold=sam3_confidence)
+        self.face_detector = RetinaFaceDetector(device=device, det_thresh=face_det_thresh)
+        self.gaze_predictor = GazePredictor(checkpoint_path=gaze_checkpoint, device=device)
+    
+    def annotate_video(
+        self,
+        video_path: str,
+        max_frames: Optional[int] = None,
+        progress_bar: bool = True,
+        sample_fps: Optional[float] = None,  # Process at this fps (e.g., 2.0 = 2fps)
+    ) -> Dict:
+        """
+        Annotate video with person tracking and gaze estimation.
+        
+        Args:
+            video_path: Path to input video
+            max_frames: Maximum frames to process
+            progress_bar: Show progress bar
+            sample_fps: Sample video at this fps for per-frame processing.
+                        SAM3 tracking still uses all frames, but RetinaFace+Gaze
+                        only runs on sampled frames. Default None = all frames.
+        
+        Returns:
+            Dict with video metadata and per-frame annotations
+        """
+        # Phase 1: Track persons with SAM3 (uses all frames)
+        person_tracks, video_size, video_fps = self.person_tracker.process_video(
+            video_path, max_frames=max_frames
+        )
+        
+        width, height = video_size
+        
+        # Get video info
+        cap = cv2.VideoCapture(video_path)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        video_duration = total_frames / video_fps if video_fps > 0 else 0
+        
+        # Calculate frames to process for per-frame gaze estimation
+        all_tracked_frames = sorted(person_tracks.keys())
+        
+        if sample_fps and sample_fps < video_fps:
+            # Sample at target fps using time-based calculation
+            sample_interval_sec = 1.0 / sample_fps
+            sampled_frames = set()
+            t = 0.0
+            while t < video_duration:
+                frame_idx = int(t * video_fps)
+                if frame_idx in person_tracks:
+                    sampled_frames.add(frame_idx)
+                t += sample_interval_sec
+            frame_indices = sorted(sampled_frames)
+            effective_fps = sample_fps
+        else:
+            frame_indices = all_tracked_frames
+            effective_fps = video_fps
+        
+        if max_frames:
+            frame_indices = frame_indices[:max_frames]
+        
+        results = {
+            "video_path": video_path,
+            "video_fps": video_fps,
+            "sample_fps": effective_fps,
+            "video_size": list(video_size),
+            "total_frames": total_frames,
+            "processed_frames": len(frame_indices),
+            "tracking_method": "sam3_text_prompt",
+            "persons_summary": {},
+            "frames": [],
+        }
+        
+        person_frames = {}  # Track frame appearances
+        
+        # Phase 2 & 3: For each sampled frame, detect faces and estimate gaze
+        if sample_fps:
+            print(f"Processing faces and gaze at {sample_fps:.1f}fps ({len(frame_indices)} frames)...")
+        else:
+            print(f"Processing faces and gaze per frame ({len(frame_indices)} frames)...")
+        pbar = tqdm(frame_indices, desc="Estimating gaze", disable=not progress_bar)
+        
+        for frame_idx in pbar:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame_bgr = cap.read()
+            if not ret:
+                continue
+            
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            
+            # Detect all faces in frame
+            face_detections = self.face_detector.detect_faces(frame_bgr)
+            
+            # Match faces to tracked persons
+            persons_this_frame = person_tracks[frame_idx]
+            face_matches = match_faces_to_persons(face_detections, persons_this_frame)
+            
+            frame_data = {
+                "frame_idx": frame_idx,
+                "timestamp": frame_idx / video_fps if video_fps > 0 else 0,
+                "persons": [],
+            }
+            
+            for person in persons_this_frame:
+                # Track appearances
+                if person.person_id not in person_frames:
+                    person_frames[person.person_id] = []
+                person_frames[person.person_id].append(frame_idx)
+                
+                matched_face = face_matches.get(person.person_id)
+                
+                person_data = {
+                    "person_id": person.person_id,
+                    "body_bbox": list(person.bbox),
+                    "body_bbox_px": list(person.bbox_px),
+                    "detection_score": person.score,
+                    "face_detected": matched_face is not None,
+                }
+                
+                if matched_face is not None:
+                    # Use face position for gaze estimation
+                    position_prompt = GazePredictor.format_position_prompt(matched_face.bbox)
+                    gaze_result = self.gaze_predictor.predict(frame_rgb, position_prompt)
+                    
+                    person_data.update({
+                        "face_bbox": list(matched_face.bbox),
+                        "face_bbox_px": list(matched_face.bbox_px),
+                        "head_bbox": list(gaze_result["head_bbox"]),
+                        "head_bbox_px": list(gaze_result["head_bbox_px"]),
+                        "gaze_point": list(gaze_result["gaze_point"]),
+                        "gaze_point_px": list(gaze_result["gaze_point_px"]),
+                        "inout": gaze_result["inout"],
+                    })
+                else:
+                    # No face found - still include person but no gaze
+                    person_data.update({
+                        "face_bbox": None,
+                        "face_bbox_px": None,
+                        "head_bbox": None,
+                        "head_bbox_px": None,
+                        "gaze_point": None,
+                        "gaze_point_px": None,
+                        "inout": None,
+                    })
+                
+                frame_data["persons"].append(person_data)
+            
+            results["frames"].append(frame_data)
+        
+        cap.release()
+        
+        # Add person summary
+        for person_id, frames in person_frames.items():
+            # Calculate face detection rate and in-frame gaze percentage
+            face_detected_count = sum(
+                1 for fd in results["frames"]
+                for p in fd["persons"]
+                if p["person_id"] == person_id and p["face_detected"]
+            )
+            inframe_count = sum(
+                1 for fd in results["frames"]
+                for p in fd["persons"]
+                if p["person_id"] == person_id and p.get("inout") is True
+            )
+            
+            results["persons_summary"][str(person_id)] = {
+                "first_frame": min(frames),
+                "last_frame": max(frames),
+                "track_length": len(frames),
+                "face_detection_pct": round(100 * face_detected_count / len(frames), 1) if frames else 0,
+                "inframe_gaze_pct": round(100 * inframe_count / len(frames), 1) if frames else 0,
+            }
+        
+        return results
+    
+    def save_results(self, results: Dict, output_path: str) -> None:
+        """Save annotation results to JSON file."""
+        class NumpyEncoder(json.JSONEncoder):
+            def default(self, obj):
+                if isinstance(obj, torch.Tensor):
+                    return obj.cpu().numpy().tolist()
+                if isinstance(obj, np.floating):
+                    return float(obj)
+                if isinstance(obj, np.integer):
+                    return int(obj)
+                if isinstance(obj, np.ndarray):
+                    return obj.tolist()
+                return super().default(obj)
+        
+        os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+        with open(output_path, 'w') as f:
+            json.dump(results, f, indent=2, cls=NumpyEncoder)
+        print(f"Saved results to: {output_path}")
+    
+    def reset(self):
+        """Reset state for batch processing."""
+        # SAM3 session is already closed in process_video()
+        # No additional state to reset for this pipeline
+        pass
+
+
+# ============================================================================
+# Visualization
+# ============================================================================
+
+def visualize_annotations(
+    video_path: str,
+    results: Dict,
+    output_path: str,
+    show_body_bbox: bool = True,
+    show_face_bbox: bool = True,
+    show_head_bbox: bool = True,
+    show_gaze: bool = True,
+    progress_bar: bool = True,
+) -> None:
+    """Create visualization video with annotations overlaid."""
+    cap = cv2.VideoCapture(video_path)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = results.get("video_fps", cap.get(cv2.CAP_PROP_FPS))
+    
+    os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+    
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    
+    # Color palette
+    colors = [
+        (0, 255, 0),    # Green
+        (255, 128, 0),  # Blue-ish
+        (0, 128, 255),  # Orange
+        (255, 255, 0),  # Cyan
+        (255, 0, 255),  # Magenta
+        (0, 255, 255),  # Yellow
+        (128, 0, 255),  # Purple
+        (255, 0, 128),  # Pink
+    ]
+    out_color = (0, 0, 255)  # Red for OUT
+    no_face_color = (128, 128, 128)  # Gray for no face detected
+    
+    pbar = tqdm(results["frames"], desc="Creating visualization", disable=not progress_bar)
+    
+    for frame_data in pbar:
+        frame_idx = frame_data["frame_idx"]
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+        
+        if not ret:
+            continue
+        
+        for person in frame_data["persons"]:
+            person_id = person["person_id"]
+            color = colors[person_id % len(colors)]
+            face_detected = person.get("face_detected", False)
+            inout = person.get("inout")
+            
+            if face_detected and person.get("face_bbox_px"):
+                # Draw face bbox (from RetinaFace) with person ID label
+                fx1, fy1, fx2, fy2 = map(int, person["face_bbox_px"])
+                cv2.rectangle(frame, (fx1, fy1), (fx2, fy2), color, 2, cv2.LINE_AA)
+                
+                # Person ID label
+                label = f"P{person_id}"
+                (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                cv2.rectangle(frame, (fx1, fy1 - th - 8), (fx1 + tw + 4, fy1), color, -1)
+                cv2.putText(frame, label, (fx1 + 2, fy1 - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
+                
+                # Draw gaze line and point
+                if show_gaze:
+                    # Use face center as gaze origin
+                    fcx, fcy = int((fx1 + fx2) / 2), int((fy1 + fy2) / 2)
+                    
+                    if inout and person.get("gaze_point_px"):
+                        gx, gy = int(person["gaze_point_px"][0]), int(person["gaze_point_px"][1])
+                        cv2.line(frame, (fcx, fcy), (gx, gy), color, 2, cv2.LINE_AA)
+                        cv2.circle(frame, (gx, gy), 12, color, -1, cv2.LINE_AA)
+                        cv2.circle(frame, (gx, gy), 12, (255, 255, 255), 2, cv2.LINE_AA)
+                    elif inout is False:
+                        cv2.putText(frame, "OUT", (fcx - 20, fcy + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, out_color, 2, cv2.LINE_AA)
+        
+        # Frame info
+        info_text = f"Frame: {frame_idx} | t={frame_data['timestamp']:.2f}s | {len(frame_data['persons'])} person(s)"
+        (tw, th), _ = cv2.getTextSize(info_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+        cv2.rectangle(frame, (5, 5), (15 + tw, 35), (0, 0, 0), -1)
+        cv2.putText(frame, info_text, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+        
+        out.write(frame)
+    
+    cap.release()
+    out.release()
+    
+    _reencode_video_h264(output_path)
+    print(f"Saved visualization to: {output_path}")
+
+
+def _reencode_video_h264(video_path: str) -> None:
+    """Re-encode video with H.264 codec for better compatibility."""
+    import subprocess
+    import shutil
+    
+    if shutil.which("ffmpeg") is None:
+        print("Warning: ffmpeg not found, skipping H.264 re-encoding.")
+        return
+    
+    temp_path = video_path + ".temp.mp4"
+    
+    try:
+        os.rename(video_path, temp_path)
+        
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", temp_path,
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            "-loglevel", "error",
+            video_path
+        ]
+        
+        subprocess.run(cmd, check=True)
+        os.remove(temp_path)
+        
+    except Exception as e:
+        print(f"Warning: H.264 re-encoding failed: {e}")
+        if os.path.exists(temp_path) and not os.path.exists(video_path):
+            os.rename(temp_path, video_path)
+
+
+# ============================================================================
+# Main
+# ============================================================================
+
+DEFAULT_OUTPUT_DIR = "/u/arkimjh/code/ECCV-jh/data_results"
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="SAM3 Person Tracking + RetinaFace + GazeAnywhere Pipeline"
+    )
+    
+    # Input/output
+    parser.add_argument("--video_path", type=str, required=True, help="Path to input video")
+    parser.add_argument("--output_dir", type=str, default=DEFAULT_OUTPUT_DIR,
+                        help="Output directory for results")
+    parser.add_argument("--output_json", type=str, default=None, 
+                        help="Path to output JSON (auto-generated if not specified)")
+    parser.add_argument("--output_video", type=str, default=None, 
+                        help="Path to visualization video (auto-generated if not specified)")
+    parser.add_argument("--no_visualization", action="store_true",
+                        help="Skip visualization video generation")
+    
+    # Model options
+    parser.add_argument(
+        "--gaze_checkpoint", type=str,
+        default="/projects/illinois/eng/cs/jrehg/users/xucao2/ChildGaze/checkpoints/GazeAnywhere/gazeanywhere.pth",
+        help="Path to GazeAnywhere checkpoint"
+    )
+    parser.add_argument("--device", type=str, default="cuda", help="Device (cuda/cpu)")
+    
+    # Processing options
+    parser.add_argument("--max_frames", type=int, default=None, help="Max frames to process")
+    parser.add_argument("--sam3_confidence", type=float, default=0.5, help="SAM3 detection confidence")
+    parser.add_argument("--face_det_thresh", type=float, default=0.5, help="RetinaFace detection threshold")
+    
+    args = parser.parse_args()
+    
+    # Setup output paths
+    os.makedirs(args.output_dir, exist_ok=True)
+    video_name = Path(args.video_path).stem
+    
+    if args.output_json is None:
+        args.output_json = os.path.join(args.output_dir, f"{video_name}_sam3rf_gaze.json")
+    
+    if args.output_video is None and not args.no_visualization:
+        args.output_video = os.path.join(args.output_dir, f"{video_name}_sam3rf_viz.mp4")
+    
+    # Initialize annotator
+    print("="*60)
+    print("SAM3 Person Tracking + RetinaFace + GazeAnywhere Pipeline")
+    print("="*60)
+    print("Initializing models...")
+    
+    annotator = Sam3RetinaFaceGazeAnnotator(
+        device=args.device,
+        gaze_checkpoint=args.gaze_checkpoint,
+        sam3_confidence=args.sam3_confidence,
+        face_det_thresh=args.face_det_thresh,
+    )
+    
+    # Process video
+    print(f"\nProcessing: {args.video_path}")
+    results = annotator.annotate_video(
+        args.video_path,
+        max_frames=args.max_frames,
+    )
+    
+    # Save results
+    annotator.save_results(results, args.output_json)
+    
+    # Print summary
+    print(f"\n{'='*60}")
+    print("Annotation Summary")
+    print(f"{'='*60}")
+    print(f"  Video: {results['video_path']}")
+    print(f"  Size: {results['video_size'][0]}x{results['video_size'][1]}")
+    print(f"  FPS: {results['video_fps']:.2f}")
+    print(f"  Total frames: {results['total_frames']}")
+    print(f"  Processed frames: {results['processed_frames']}")
+    print(f"  Unique persons: {len(results['persons_summary'])}")
+    
+    for pid, summary in results["persons_summary"].items():
+        print(f"    Person {pid}: frames {summary['first_frame']}-{summary['last_frame']} "
+              f"({summary['track_length']} frames, "
+              f"face={summary['face_detection_pct']:.1f}%, "
+              f"inframe_gaze={summary['inframe_gaze_pct']:.1f}%)")
+    
+    print(f"\nOutput JSON: {args.output_json}")
+    
+    # Create visualization
+    if args.output_video and not args.no_visualization:
+        print(f"\nCreating visualization...")
+        visualize_annotations(
+            args.video_path,
+            results,
+            args.output_video
+        )
+        print(f"Output video: {args.output_video}")
+
+
+if __name__ == "__main__":
+    main()
