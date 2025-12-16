@@ -21,9 +21,9 @@ import json
 import os
 from typing import Dict, List, Optional
 
-from gaze_feature_extractor import extract_gaze_features, save_features
-from candidate_event_detector import detect_all_events, save_events
-from gemini_gesture_classifier import classify_events, save_classifications
+from .gaze_feature_extractor import extract_gaze_features, save_features
+from .candidate_event_detector import detect_all_events, save_events
+from .gemini_gesture_classifier import classify_events, save_classifications
 
 
 def run_full_pipeline(

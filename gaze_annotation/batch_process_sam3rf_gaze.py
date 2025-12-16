@@ -15,10 +15,13 @@ import glob
 import os
 import sys
 
-# Add parent directory to path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Set CUDA memory allocation config to avoid fragmentation
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
-from sam3_retinaface_gaze_pipeline import (
+# Add parent directory to path for running as script
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from gaze_annotation.sam3_retinaface_gaze_pipeline import (
     Sam3RetinaFaceGazeAnnotator,
     visualize_annotations,
 )
@@ -39,10 +42,15 @@ def main():
     
     args = parser.parse_args()
     
-    # Find all videos
+    # Find all videos (including subdirectories)
     video_paths = sorted(glob.glob(os.path.join(args.input_dir, "*.mp4")))
+    video_paths += sorted(glob.glob(os.path.join(args.input_dir, "**/*.mp4"), recursive=True))
     video_paths += sorted(glob.glob(os.path.join(args.input_dir, "*.avi")))
+    video_paths += sorted(glob.glob(os.path.join(args.input_dir, "**/*.avi"), recursive=True))
     video_paths += sorted(glob.glob(os.path.join(args.input_dir, "*.mov")))
+    video_paths += sorted(glob.glob(os.path.join(args.input_dir, "**/*.mov"), recursive=True))
+    # Remove duplicates while preserving order
+    video_paths = list(dict.fromkeys(video_paths))
     
     print(f"Found {len(video_paths)} videos in {args.input_dir}")
     
@@ -117,6 +125,20 @@ def main():
             import traceback
             traceback.print_exc()
             errors += 1
+            
+            # CRITICAL: Reset even on error to free GPU memory
+            try:
+                annotator.reset()
+            except:
+                pass
+            
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            
+            print(f"  [GPU Memory after error cleanup: {torch.cuda.memory_allocated()/1e9:.1f}GB]")
             continue
     
     print(f"\nDone! Processed: {processed}, Skipped: {skipped}, Errors: {errors}")

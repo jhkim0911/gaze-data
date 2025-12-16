@@ -15,10 +15,10 @@ import glob
 import os
 import sys
 
-# Add parent directory to path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Add parent directory to path for running as script
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from retinaface_perframe_pipeline import (
+from gaze_annotation.retinaface_perframe_pipeline import (
     RetinaFacePerFrameAnnotator,
     visualize_annotations,
 )

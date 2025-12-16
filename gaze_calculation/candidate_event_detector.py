@@ -228,9 +228,10 @@ def detect_joint_attention(
 
 def detect_gaze_following(
     frame_features: List[Dict],
-    distance_threshold: float = 0.15,
-    min_lag_sec: float = 0.3,
+    distance_threshold: float = 0.03,  # Very strict for obvious matches
+    min_lag_sec: float = 1.0,
     max_lag_sec: float = 2.0,
+    min_event_confidence: float = 0.9, # Only very high-confidence events
 ) -> List[CandidateEvent]:
     """
     Detect gaze following events where Person B looks where Person A looked.
@@ -243,13 +244,16 @@ def detect_gaze_following(
     events = []
     event_id = 2000
     
-    # Build gaze history per person
+    # Build gaze history per person (only high-confidence gaze)
     person_gaze_history: Dict[int, List[Tuple[float, int, Tuple[float, float]]]] = {}
     
     for ff in frame_features:
+        confidences = ff.get("person_gaze_confidences", {})
         for pid_str, gaze in ff.get("person_gaze_points", {}).items():
             pid = int(pid_str)
-            if gaze is not None:
+            conf = confidences.get(str(pid), confidences.get(pid, 0))
+            # Only use gaze points with confidence >= 0.5
+            if gaze is not None and conf >= 0.5:
                 if pid not in person_gaze_history:
                     person_gaze_history[pid] = []
                 person_gaze_history[pid].append((ff["timestamp"], ff["frame_idx"], tuple(gaze)))
@@ -273,24 +277,26 @@ def detect_gaze_following(
                         if dist < distance_threshold:
                             confidence = 1.0 - (dist / distance_threshold)
                             
-                            events.append(CandidateEvent(
-                                event_id=event_id,
-                                event_type="gaze_following",
-                                start_time=t_a,
-                                end_time=t_b,
-                                start_frame=frame_a,
-                                end_frame=frame_b,
-                                confidence=confidence,
-                                persons_involved=[pid_a, pid_b],
-                                details={
-                                    "leader_id": pid_a,
-                                    "follower_id": pid_b,
-                                    "lag_seconds": lag,
-                                    "gaze_distance": dist,
-                                    "gaze_target": list(gaze_a),
-                                }
-                            ))
-                            event_id += 1
+                            # Only keep high-confidence events
+                            if confidence >= min_event_confidence:
+                                events.append(CandidateEvent(
+                                    event_id=event_id,
+                                    event_type="gaze_following",
+                                    start_time=t_a,
+                                    end_time=t_b,
+                                    start_frame=frame_a,
+                                    end_frame=frame_b,
+                                    confidence=confidence,
+                                    persons_involved=[pid_a, pid_b],
+                                    details={
+                                        "leader_id": pid_a,
+                                        "follower_id": pid_b,
+                                        "lag_seconds": lag,
+                                        "gaze_distance": dist,
+                                        "gaze_target": list(gaze_a),
+                                    }
+                                ))
+                                event_id += 1
     
     return events
 

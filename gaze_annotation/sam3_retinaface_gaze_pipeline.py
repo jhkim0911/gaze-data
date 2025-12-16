@@ -19,6 +19,8 @@ import argparse
 import json
 import os
 import sys
+import tempfile
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -29,6 +31,94 @@ import torch
 from PIL import Image
 from tqdm import tqdm
 from scipy.optimize import linear_sum_assignment
+
+# Try to import decord for efficient video reading
+try:
+    import decord
+    decord.bridge.set_bridge("torch")
+    DECORD_AVAILABLE = True
+except ImportError:
+    DECORD_AVAILABLE = False
+
+
+def extract_sampled_frames_to_dir(
+    video_path: str,
+    output_dir: str,
+    sample_fps: float = 2.0,
+    max_frames: Optional[int] = None,
+) -> Tuple[List[int], float, int]:
+    """
+    Extract sampled frames from video to a directory.
+    
+    Uses decord for efficient reading - only loads frames we need.
+    
+    Args:
+        video_path: Path to video file
+        output_dir: Directory to save frame images
+        sample_fps: Target frames per second to sample
+        max_frames: Maximum number of frames to extract
+        
+    Returns:
+        Tuple of (frame_indices, original_fps, total_original_frames)
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    if DECORD_AVAILABLE:
+        # Use decord for efficient frame extraction
+        vr = decord.VideoReader(video_path, num_threads=1)
+        total_frames = len(vr)
+        fps = vr.get_avg_fps()
+        
+        # Calculate which frames to sample
+        frame_interval = fps / sample_fps
+        frame_indices = []
+        idx = 0.0
+        while int(idx) < total_frames:
+            frame_indices.append(int(idx))
+            idx += frame_interval
+            if max_frames and len(frame_indices) >= max_frames:
+                break
+        
+        # Extract only the sampled frames (efficient!)
+        print(f"  Extracting {len(frame_indices)} sampled frames (from {total_frames} total)...")
+        frames = vr.get_batch(frame_indices)  # Only reads needed frames
+        
+        # Save as images
+        for i, (frame_idx, frame) in enumerate(zip(frame_indices, frames)):
+            # frame is (H, W, C) torch tensor
+            frame_np = frame.numpy()
+            img = Image.fromarray(frame_np)
+            img.save(os.path.join(output_dir, f"{i:06d}.jpg"))
+        
+        del frames, vr
+        
+    else:
+        # Fallback to cv2
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        frame_interval = fps / sample_fps
+        frame_indices = []
+        idx = 0.0
+        while int(idx) < total_frames:
+            frame_indices.append(int(idx))
+            idx += frame_interval
+            if max_frames and len(frame_indices) >= max_frames:
+                break
+        
+        print(f"  Extracting {len(frame_indices)} sampled frames (from {total_frames} total)...")
+        for i, frame_idx in enumerate(frame_indices):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            if ret:
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                img = Image.fromarray(frame_rgb)
+                img.save(os.path.join(output_dir, f"{i:06d}.jpg"))
+        
+        cap.release()
+    
+    return frame_indices, fps, total_frames
 
 # ============================================================================
 # Data Classes
@@ -51,6 +141,7 @@ class FaceDetection:
     bbox_px: Tuple[int, int, int, int]  # (x1, y1, x2, y2) pixels
     score: float
     landmarks: Optional[np.ndarray] = None
+    embedding: Optional[np.ndarray] = None  # 512-dim face embedding for re-ID
 
 
 @dataclass
@@ -192,16 +283,19 @@ class Sam3PersonTracker:
         self,
         video_path: str,
         max_frames: Optional[int] = None,
-    ) -> Tuple[Dict[int, List[PersonTrack]], Tuple[int, int], float]:
+        sample_fps: Optional[float] = None,
+        use_presampling: bool = True,
+        chunk_size: int = 125,  # Process 125 frames at a time (~62.5s at 2fps)
+        overlap_frames: int = 5,  # Overlap between chunks for better ID matching
+    ) -> Tuple[Dict[int, List[PersonTrack]], Tuple[int, int], float, Optional[List[int]]]:
         """
-        Full video processing: detect and track all persons.
+        Full video processing with subprocess-based chunk approach.
         
-        Returns:
-            Tuple of:
-                - Dict mapping frame_idx to list of PersonTrack
-                - Video size (width, height)
-                - Video FPS
+        Each chunk runs in a subprocess to guarantee GPU memory is freed.
         """
+        import subprocess
+        import gc
+        
         # Get video metadata
         cap = cv2.VideoCapture(video_path)
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -210,31 +304,261 @@ class Sam3PersonTracker:
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         cap.release()
         
-        try:
-            print(f"Starting SAM3 person tracking ({total_frames} frames)...")
-            self.start_session(video_path)
-            
-            print("Detecting persons with text prompt 'people'...")
-            self.detect_persons(frame_index=0)
-            
-            print("Propagating tracking through video...")
-            tracks = self.propagate_tracking(max_frames=max_frames)
-            
-            # Convert normalized bboxes to pixel coordinates
-            for frame_idx, persons in tracks.items():
-                for person in persons:
-                    x1, y1, x2, y2 = person.bbox
-                    person.bbox_px = (
-                        int(x1 * width),
-                        int(y1 * height),
-                        int(x2 * width),
-                        int(y2 * height),
-                    )
-            
-            return tracks, (width, height), fps
+        # Pre-extract sampled frames
+        temp_dir = None
+        original_frame_indices = None
         
+        if use_presampling and sample_fps is not None:
+            temp_dir = tempfile.mkdtemp(prefix="sam3_frames_")
+            print(f"  Pre-extracting frames at {sample_fps}fps...")
+            
+            try:
+                original_frame_indices, _, _ = extract_sampled_frames_to_dir(
+                    video_path=video_path,
+                    output_dir=temp_dir,
+                    sample_fps=sample_fps,
+                    max_frames=max_frames,
+                )
+                print(f"  Extracted {len(original_frame_indices)} frames")
+            except Exception as e:
+                print(f"  Warning: Pre-extraction failed ({e})")
+                if temp_dir and os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)
+                return {}, (width, height), fps, None
+        else:
+            temp_dir = tempfile.mkdtemp(prefix="sam3_frames_")
+            # Extract all frames
+            original_frame_indices = list(range(min(total_frames, max_frames or total_frames)))
+            cap = cv2.VideoCapture(video_path)
+            for i, frame_idx in enumerate(original_frame_indices):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                ret, frame = cap.read()
+                if ret:
+                    cv2.imwrite(os.path.join(temp_dir, f"{i:06d}.jpg"), frame)
+            cap.release()
+        
+        num_frames = len(original_frame_indices)
+        
+        # Calculate chunks
+        num_chunks = (num_frames + chunk_size - 1) // chunk_size
+        print(f"  Processing in {num_chunks} chunks of ≤{chunk_size} frames (SUBPROCESS mode)...")
+        
+        all_tracks = {}
+        global_id_map = {}
+        next_global_id = 0
+        prev_chunk_last_frame_tracks = None
+        
+        # Get the worker script path
+        worker_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sam3_chunk_worker.py")
+        
+        try:
+            for chunk_idx in range(num_chunks):
+                # For chunks after the first, start with overlap_frames from previous chunk
+                # This gives SAM3 context to establish tracking before new frames
+                if chunk_idx == 0:
+                    start_idx = 0
+                    overlap_start = 0  # No overlap for first chunk
+                else:
+                    start_idx = chunk_idx * chunk_size - overlap_frames  # Start earlier with overlap
+                    overlap_start = overlap_frames  # Skip first N frames in output
+                    start_idx = max(0, start_idx)  # Don't go negative
+                
+                end_idx = min((chunk_idx + 1) * chunk_size, num_frames)
+                chunk_frame_indices = list(range(start_idx, end_idx))
+                
+                print(f"  Chunk {chunk_idx+1}/{num_chunks}: frames {start_idx}-{end_idx-1} (overlap={overlap_start})")
+                
+                # Create temp dir for this chunk
+                chunk_temp_dir = tempfile.mkdtemp(prefix=f"sam3_chunk{chunk_idx}_")
+                chunk_output_json = os.path.join(chunk_temp_dir, "tracks.json")
+                
+                try:
+                    # Copy chunk frames to temp dir
+                    for i, frame_idx in enumerate(chunk_frame_indices):
+                        src = os.path.join(temp_dir, f"{frame_idx:06d}.jpg")
+                        dst = os.path.join(chunk_temp_dir, f"{i:06d}.jpg")
+                        if os.path.exists(src):
+                            shutil.copy(src, dst)
+                    
+                    # Run chunk worker in subprocess (GPU memory freed on exit!)
+                    result = subprocess.run(
+                        [
+                            sys.executable, worker_script,
+                            "--frames_dir", chunk_temp_dir,
+                            "--output_json", chunk_output_json,
+                            "--confidence", str(self.confidence_threshold),
+                        ],
+                        capture_output=True,
+                        text=True,
+                    )
+                    
+                    if result.returncode != 0:
+                        print(f"    Chunk subprocess failed: {result.stderr}")
+                        continue
+                    
+                    # Print worker output for debugging
+                    if result.stdout.strip():
+                        for line in result.stdout.strip().split('\n'):
+                            print(f"      [worker] {line}")
+                    
+                    # Load results from JSON
+                    if not os.path.exists(chunk_output_json):
+                        print(f"    No output JSON found")
+                        continue
+                    
+                    with open(chunk_output_json) as f:
+                        chunk_data = json.load(f)
+                    
+                    print(f"    Chunk JSON has {chunk_data.get('num_frames', 0)} frames")
+                    
+                    # Convert JSON to PersonTrack objects
+                    chunk_tracks = {}
+                    for frame_idx_str, persons_data in chunk_data.get("tracks", {}).items():
+                        frame_idx = int(frame_idx_str)
+                        persons = []
+                        for p in persons_data:
+                            persons.append(PersonTrack(
+                                person_id=p["person_id"],
+                                bbox=tuple(p["bbox"]),
+                                bbox_px=(0, 0, 0, 0),
+                                score=p["score"],
+                                mask=None,
+                            ))
+                        chunk_tracks[frame_idx] = persons
+                    
+                    # Map local IDs to global IDs
+                    if chunk_idx == 0:
+                        for local_frame_idx, persons in chunk_tracks.items():
+                            for person in persons:
+                                key = (chunk_idx, person.person_id)
+                                if key not in global_id_map:
+                                    global_id_map[key] = next_global_id
+                                    next_global_id += 1
+                    else:
+                        # Match with previous chunk using Hungarian algorithm
+                        first_frame_persons = chunk_tracks.get(0, [])
+                        
+                        if prev_chunk_last_frame_tracks and first_frame_persons:
+                            n_new = len(first_frame_persons)
+                            n_prev = len(prev_chunk_last_frame_tracks)
+                            
+                            cost_matrix = np.ones((n_new, n_prev))
+                            for i, new_person in enumerate(first_frame_persons):
+                                for j, prev_person in enumerate(prev_chunk_last_frame_tracks):
+                                    iou = self._compute_iou(new_person.bbox, prev_person.bbox)
+                                    cost_matrix[i, j] = 1.0 - iou
+                            
+                            row_indices, col_indices = linear_sum_assignment(cost_matrix)
+                            
+                            for row_idx, col_idx in zip(row_indices, col_indices):
+                                iou = 1.0 - cost_matrix[row_idx, col_idx]
+                                if iou >= 0.3:
+                                    new_person = first_frame_persons[row_idx]
+                                    prev_person = prev_chunk_last_frame_tracks[col_idx]
+                                    prev_key = (chunk_idx - 1, prev_person.person_id)
+                                    if prev_key in global_id_map:
+                                        global_id_map[(chunk_idx, new_person.person_id)] = global_id_map[prev_key]
+                            
+                            for i, new_person in enumerate(first_frame_persons):
+                                key = (chunk_idx, new_person.person_id)
+                                if key not in global_id_map:
+                                    global_id_map[key] = next_global_id
+                                    next_global_id += 1
+                        
+                        for local_frame_idx, persons in chunk_tracks.items():
+                            for person in persons:
+                                key = (chunk_idx, person.person_id)
+                                if key not in global_id_map:
+                                    global_id_map[key] = next_global_id
+                                    next_global_id += 1
+                    
+                    # Save last frame for next chunk matching
+                    if chunk_tracks:
+                        last_frame_idx = max(chunk_tracks.keys())
+                        prev_chunk_last_frame_tracks = chunk_tracks[last_frame_idx]
+                    
+                    # Merge into all_tracks (skip overlap frames for chunks > 0)
+                    frames_merged = 0
+                    for local_frame_idx, persons in chunk_tracks.items():
+                        # Skip overlap frames - they were just for context
+                        if local_frame_idx < overlap_start:
+                            continue
+                        
+                        original_idx = original_frame_indices[start_idx + local_frame_idx]
+                        
+                        # Avoid duplicate frames (overlap region)
+                        if original_idx in all_tracks:
+                            continue
+                        
+                        remapped_persons = []
+                        for person in persons:
+                            key = (chunk_idx, person.person_id)
+                            global_id = global_id_map.get(key, person.person_id)
+                            
+                            x1, y1, x2, y2 = person.bbox
+                            remapped_person = PersonTrack(
+                                person_id=global_id,
+                                bbox=person.bbox,
+                                bbox_px=(
+                                    int(x1 * width),
+                                    int(y1 * height),
+                                    int(x2 * width),
+                                    int(y2 * height),
+                                ),
+                                score=person.score,
+                                mask=None,
+                            )
+                            remapped_persons.append(remapped_person)
+                        
+                        all_tracks[original_idx] = remapped_persons
+                        frames_merged += 1
+                    
+                    print(f"    Chunk {chunk_idx+1} done - {frames_merged} frames merged (skipped {overlap_start} overlap)")
+                    
+                finally:
+                    if os.path.exists(chunk_temp_dir):
+                        shutil.rmtree(chunk_temp_dir)
+                    
+                    # Clean up GPU memory after each chunk
+                    try:
+                        self.end_session()
+                    except:
+                        pass
+                    if self._predictor is not None:
+                        try:
+                            if hasattr(self._predictor, 'model'):
+                                self._predictor.model.cpu()
+                            del self._predictor
+                            self._predictor = None
+                        except:
+                            pass
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+            
+            print(f"  Tracked {next_global_id} unique persons across all chunks")
+            return all_tracks, (width, height), fps, original_frame_indices
+            
         finally:
-            self.end_session()
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir)
+    
+    def _compute_iou(self, bbox1, bbox2):
+        """Compute IoU between two normalized bboxes."""
+        x1 = max(bbox1[0], bbox2[0])
+        y1 = max(bbox1[1], bbox2[1])
+        x2 = min(bbox1[2], bbox2[2])
+        y2 = min(bbox1[3], bbox2[3])
+        
+        if x2 <= x1 or y2 <= y1:
+            return 0.0
+        
+        intersection = (x2 - x1) * (y2 - y1)
+        area1 = (bbox1[2] - bbox1[0]) * (bbox1[3] - bbox1[1])
+        area2 = (bbox2[2] - bbox2[0]) * (bbox2[3] - bbox2[1])
+        union = area1 + area2 - intersection
+        
+        return intersection / union if union > 0 else 0.0
 
 
 # ============================================================================
@@ -293,6 +617,7 @@ class RetinaFaceDetector:
                 bbox_px=bbox_px,
                 score=float(face.det_score),
                 landmarks=face.kps if hasattr(face, 'kps') else None,
+                embedding=face.embedding if hasattr(face, 'embedding') else None,
             ))
         
         return detections
@@ -477,10 +802,15 @@ class Sam3RetinaFaceGazeAnnotator:
         Returns:
             Dict with video metadata and per-frame annotations
         """
-        # Phase 1: Track persons with SAM3 (uses all frames)
-        person_tracks, video_size, video_fps = self.person_tracker.process_video(
-            video_path, max_frames=max_frames
+        # Phase 1: Track persons with SAM3
+        # For long videos, SAM3 will use presampling to reduce GPU memory
+        result = self.person_tracker.process_video(
+            video_path, 
+            max_frames=max_frames,
+            sample_fps=sample_fps,
+            use_presampling=True,  # Enable memory optimization for long videos
         )
+        person_tracks, video_size, video_fps, presampled_indices = result
         
         width, height = video_size
         
@@ -489,11 +819,16 @@ class Sam3RetinaFaceGazeAnnotator:
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         video_duration = total_frames / video_fps if video_fps > 0 else 0
         
+        # Note: process_video's chunk processing already remaps frame indices to original video coordinates
+        # So person_tracks already has original frame indices, no need to remap again!
+        if presampled_indices is not None:
+            print(f"  Got {len(person_tracks)} frames from SAM3 (already remapped to original coordinates)")
+        
         # Calculate frames to process for per-frame gaze estimation
         all_tracked_frames = sorted(person_tracks.keys())
         
-        if sample_fps and sample_fps < video_fps:
-            # Sample at target fps using time-based calculation
+        if sample_fps and sample_fps < video_fps and presampled_indices is None:
+            # Sample at target fps (only if not already presampled)
             sample_interval_sec = 1.0 / sample_fps
             sampled_frames = set()
             t = 0.0
@@ -506,7 +841,7 @@ class Sam3RetinaFaceGazeAnnotator:
             effective_fps = sample_fps
         else:
             frame_indices = all_tracked_frames
-            effective_fps = video_fps
+            effective_fps = sample_fps if sample_fps else video_fps
         
         if max_frames:
             frame_indices = frame_indices[:max_frames]
@@ -524,6 +859,7 @@ class Sam3RetinaFaceGazeAnnotator:
         }
         
         person_frames = {}  # Track frame appearances
+        person_embeddings = {}  # Store face embeddings for each person ID (for re-ID)
         
         # Phase 2 & 3: For each sampled frame, detect faces and estimate gaze
         if sample_fps:
@@ -570,6 +906,12 @@ class Sam3RetinaFaceGazeAnnotator:
                 }
                 
                 if matched_face is not None:
+                    # Store face embedding for this person (for re-ID across scenes)
+                    if matched_face.embedding is not None:
+                        if person.person_id not in person_embeddings:
+                            person_embeddings[person.person_id] = []
+                        person_embeddings[person.person_id].append(matched_face.embedding)
+                    
                     # Use face position for gaze estimation
                     position_prompt = GazePredictor.format_position_prompt(matched_face.bbox)
                     gaze_result = self.gaze_predictor.predict(frame_rgb, position_prompt)
@@ -623,6 +965,100 @@ class Sam3RetinaFaceGazeAnnotator:
                 "inframe_gaze_pct": round(100 * inframe_count / len(frames), 1) if frames else 0,
             }
         
+        # Filter out false positive persons (no face detected at all)
+        # Keep only persons where face was detected at least once
+        valid_persons = set()
+        for pid, summary in results["persons_summary"].items():
+            if summary["face_detection_pct"] > 0:
+                valid_persons.add(int(pid))
+        
+        # Remove invalid persons from frames
+        for frame_data in results["frames"]:
+            frame_data["persons"] = [
+                p for p in frame_data["persons"] 
+                if p["person_id"] in valid_persons
+            ]
+        
+        # Remove invalid persons from summary
+        results["persons_summary"] = {
+            pid: summary for pid, summary in results["persons_summary"].items()
+            if int(pid) in valid_persons
+        }
+        
+        # =====================================================================
+        # Face Re-ID: Merge person IDs with similar face embeddings
+        # This links the same person re-detected with new ID within or across chunks
+        # =====================================================================
+        if person_embeddings:
+            # Compute average embedding for each valid person
+            avg_embeddings = {}
+            for pid, embeddings in person_embeddings.items():
+                if pid in valid_persons and len(embeddings) > 0:
+                    avg_emb = np.mean(embeddings, axis=0)
+                    avg_emb = avg_emb / (np.linalg.norm(avg_emb) + 1e-8)  # L2 normalize
+                    avg_embeddings[pid] = avg_emb
+            
+            # Find similar person IDs using cosine similarity
+            similarity_threshold = 0.6  # Higher threshold for conservative matching
+            id_mapping = {}  # Maps old_id -> canonical_id
+            
+            sorted_pids = sorted(avg_embeddings.keys())
+            for i, pid1 in enumerate(sorted_pids):
+                if pid1 in id_mapping:
+                    continue
+                id_mapping[pid1] = pid1  # Self-map as canonical
+                
+                for pid2 in sorted_pids[i+1:]:
+                    if pid2 in id_mapping:
+                        continue
+                    
+                    # Compute cosine similarity
+                    sim = np.dot(avg_embeddings[pid1], avg_embeddings[pid2])
+                    if sim >= similarity_threshold:
+                        id_mapping[pid2] = pid1  # Merge pid2 into pid1
+            
+            # Apply ID merging if duplicates found
+            merged_count = sum(1 for old, new in id_mapping.items() if old != new)
+            if merged_count > 0:
+                print(f"  Face Re-ID: Merged {merged_count} duplicate person IDs (threshold={similarity_threshold})")
+                
+                # Remap person IDs in frames
+                for frame_data in results["frames"]:
+                    for person in frame_data["persons"]:
+                        if person["person_id"] in id_mapping:
+                            person["person_id"] = id_mapping[person["person_id"]]
+                
+                # Rebuild persons_summary with merged IDs
+                merged_frames = {}
+                for frame_data in results["frames"]:
+                    for person in frame_data["persons"]:
+                        pid = person["person_id"]
+                        if pid not in merged_frames:
+                            merged_frames[pid] = []
+                        merged_frames[pid].append(frame_data["frame_idx"])
+                
+                merged_summary = {}
+                for pid, frame_list in merged_frames.items():
+                    face_count = sum(
+                        1 for fd in results["frames"]
+                        for p in fd["persons"]
+                        if p["person_id"] == pid and p.get("face_detected")
+                    )
+                    inframe_count = sum(
+                        1 for fd in results["frames"]
+                        for p in fd["persons"]
+                        if p["person_id"] == pid and p.get("inout") is True
+                    )
+                    unique_frames = sorted(set(frame_list))
+                    merged_summary[str(pid)] = {
+                        "first_frame": min(unique_frames),
+                        "last_frame": max(unique_frames),
+                        "track_length": len(unique_frames),
+                        "face_detection_pct": round(100 * face_count / len(unique_frames), 1) if unique_frames else 0,
+                        "inframe_gaze_pct": round(100 * inframe_count / len(unique_frames), 1) if unique_frames else 0,
+                    }
+                results["persons_summary"] = merged_summary
+        
         return results
     
     def save_results(self, results: Dict, output_path: str) -> None:
@@ -648,14 +1084,35 @@ class Sam3RetinaFaceGazeAnnotator:
         """Reset state for batch processing and free GPU memory."""
         import gc
         
-        # SAM3 session is already closed in process_video()
-        # Force garbage collection to free any remaining references
+        # Aggressively free SAM3 predictor and model GPU memory
+        if self.person_tracker._predictor is not None:
+            try:
+                self.person_tracker.end_session()
+            except:
+                pass
+            
+            # Delete the internal model to free GPU memory
+            if hasattr(self.person_tracker._predictor, 'model'):
+                try:
+                    # Move model to CPU first, then delete
+                    self.person_tracker._predictor.model.cpu()
+                    del self.person_tracker._predictor.model
+                except:
+                    pass
+            
+            del self.person_tracker._predictor
+            self.person_tracker._predictor = None
+            self.person_tracker._session_id = None
+        
+        # Force garbage collection to free remaining references
         gc.collect()
         
         # Clear CUDA cache to free GPU memory
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
+            
+        print(f"[GPU Memory Reset] After cleanup: {torch.cuda.memory_allocated()/1e9:.1f}GB allocated")
 
 
 # ============================================================================
@@ -676,12 +1133,14 @@ def visualize_annotations(
     cap = cv2.VideoCapture(video_path)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = results.get("video_fps", cap.get(cv2.CAP_PROP_FPS))
+    
+    # Use sample_fps for viz output so video plays at correct speed (not fast-forward)
+    output_fps = results.get("sample_fps", results.get("video_fps", cap.get(cv2.CAP_PROP_FPS)))
     
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
     
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    out = cv2.VideoWriter(output_path, fourcc, output_fps, (width, height))
     
     # Color palette
     colors = [
