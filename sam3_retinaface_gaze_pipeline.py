@@ -28,6 +28,7 @@ import numpy as np
 import torch
 from PIL import Image
 from tqdm import tqdm
+from scipy.optimize import linear_sum_assignment
 
 # ============================================================================
 # Data Classes
@@ -174,7 +175,7 @@ class Sam3PersonTracker:
                         bbox=box_norm,
                         bbox_px=(0, 0, 0, 0),  # Will compute later
                         score=float(score),
-                        mask=masks[i] if masks is not None and i < len(masks) else None
+                        mask=None  # Don't store masks to save memory
                     ))
             
             results[frame_idx] = tracks
@@ -342,36 +343,50 @@ def match_faces_to_persons(
     min_iou: float = 0.0
 ) -> Dict[int, Optional[FaceDetection]]:
     """
-    Match detected faces to tracked persons.
+    Match detected faces to tracked persons using Hungarian algorithm.
+    
+    Uses IoU between face bbox and upper portion of person body as cost.
+    Hungarian algorithm finds globally optimal assignment.
     
     Returns:
         Dict mapping person_id to matched FaceDetection (or None if no face found)
     """
     matches: Dict[int, Optional[FaceDetection]] = {p.person_id: None for p in person_tracks}
-    used_faces: set = set()
     
-    # For each person, find the best matching face
-    for person in person_tracks:
-        best_face = None
-        best_score = -1
-        
-        for i, face in enumerate(face_detections):
-            if i in used_faces:
-                continue
+    if len(face_detections) == 0 or len(person_tracks) == 0:
+        return matches
+    
+    n_faces = len(face_detections)
+    n_persons = len(person_tracks)
+    
+    # Build cost matrix (faces x persons)
+    # Cost = 1 - IoU (lower cost = better match)
+    # Use upper 50% of person bbox for matching (where face should be)
+    cost_matrix = np.ones((n_faces, n_persons)) * 1e6  # High cost = no match
+    
+    for i, face in enumerate(face_detections):
+        for j, person in enumerate(person_tracks):
+            # Get upper 50% of person bbox (where face should be)
+            px1, py1, px2, py2 = person.bbox_px
+            person_height = py2 - py1
+            upper_body_bbox = (px1, py1, px2, int(py1 + person_height * 0.5))
             
-            # Check if face is within person bbox
+            # Check if face center is within person bbox first
             if is_face_in_person(face.bbox_px, person.bbox_px):
-                # Use IoU as score if boxes overlap, else use containment
-                iou = compute_iou(face.bbox_px, person.bbox_px)
+                # Compute IoU with upper body
+                iou = compute_iou(face.bbox_px, upper_body_bbox)
                 if iou >= min_iou:
-                    # Prefer higher detection score
-                    if face.score > best_score:
-                        best_score = face.score
-                        best_face = (i, face)
-        
-        if best_face is not None:
-            used_faces.add(best_face[0])
-            matches[person.person_id] = best_face[1]
+                    # Cost = 1 - IoU (so higher IoU = lower cost = better)
+                    cost_matrix[i, j] = 1.0 - iou
+    
+    # Run Hungarian algorithm
+    face_indices, person_indices = linear_sum_assignment(cost_matrix)
+    
+    # Assign matches (only if cost is reasonable)
+    for face_idx, person_idx in zip(face_indices, person_indices):
+        if cost_matrix[face_idx, person_idx] < 1.0:  # Valid match (not max cost)
+            person = person_tracks[person_idx]
+            matches[person.person_id] = face_detections[face_idx]
     
     return matches
 
@@ -630,10 +645,17 @@ class Sam3RetinaFaceGazeAnnotator:
         print(f"Saved results to: {output_path}")
     
     def reset(self):
-        """Reset state for batch processing."""
+        """Reset state for batch processing and free GPU memory."""
+        import gc
+        
         # SAM3 session is already closed in process_video()
-        # No additional state to reset for this pipeline
-        pass
+        # Force garbage collection to free any remaining references
+        gc.collect()
+        
+        # Clear CUDA cache to free GPU memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
 
 # ============================================================================
@@ -709,9 +731,10 @@ def visualize_annotations(
                     
                     if inout and person.get("gaze_point_px"):
                         gx, gy = int(person["gaze_point_px"][0]), int(person["gaze_point_px"][1])
-                        cv2.line(frame, (fcx, fcy), (gx, gy), color, 2, cv2.LINE_AA)
-                        cv2.circle(frame, (gx, gy), 12, color, -1, cv2.LINE_AA)
-                        cv2.circle(frame, (gx, gy), 12, (255, 255, 255), 2, cv2.LINE_AA)
+                        # Draw directly without overlay to save memory
+                        cv2.line(frame, (fcx, fcy), (gx, gy), color, 1, cv2.LINE_AA)
+                        cv2.circle(frame, (gx, gy), 4, color, -1, cv2.LINE_AA)
+                        cv2.circle(frame, (gx, gy), 4, (255, 255, 255), 1, cv2.LINE_AA)
                     elif inout is False:
                         cv2.putText(frame, "OUT", (fcx - 20, fcy + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, out_color, 2, cv2.LINE_AA)
         

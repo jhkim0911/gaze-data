@@ -29,8 +29,8 @@ def main():
     parser = argparse.ArgumentParser(description="Batch process videos with SAM3+RetinaFace+Gaze pipeline")
     parser.add_argument("--input_dir", type=str, required=True, help="Directory containing input videos")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save outputs")
-    parser.add_argument("--sam3_confidence", type=float, default=0.5, help="SAM3 person detection confidence")
-    parser.add_argument("--face_det_thresh", type=float, default=0.6, help="RetinaFace detection threshold")
+    parser.add_argument("--sam3_confidence", type=float, default=0.45, help="SAM3 person detection confidence")
+    parser.add_argument("--face_det_thresh", type=float, default=0.54, help="RetinaFace detection threshold")
     parser.add_argument("--no_visualization", action="store_true", help="Skip visualization videos")
     parser.add_argument("--max_frames", type=int, default=None, help="Max frames per video")
     parser.add_argument("--sample_fps", type=float, default=2.0, help="Process at this fps (default: 2.0)")
@@ -102,8 +102,15 @@ def main():
             
             processed += 1
             
-            # Reset tracker for next video
+            # Aggressive memory cleanup for next video
+            del results  # Free results dict
             annotator.reset()
+            import gc
+            gc.collect()
+            
+            # Also clear CUDA cache explicitly
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             
         except Exception as e:
             print(f"  ERROR: {e}")
