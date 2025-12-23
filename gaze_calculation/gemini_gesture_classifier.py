@@ -36,38 +36,39 @@ except ImportError:
     print("Warning: google-generativeai not installed. Install: pip install google-generativeai")
 
 
-# Social gesture taxonomy
-GESTURE_TAXONOMY = {
-    "deictic": {
-        "pointing": "Directing attention to an object or location by pointing",
-        "showing": "Presenting or displaying an object to another person",
-        "giving": "Offering or handing over an object to another person",
-        "reaching": "Extending arm to acquire or touch an object",
-    },
-    "social_attention": {
-        "joint_attention": "Multiple people looking at the same target",
-        "gaze_following": "One person looking where another person looked",
-        "turn_taking": "Exchanging conversational floor (looking at new speaker)",
-        "attention_capture": "One person attracting attention of others",
-    },
-    "other": {
-        "no_gesture": "No clear social gesture occurring",
-        "unclear": "Gesture is ambiguous or cannot be determined",
-    }
+# Deictic gesture taxonomy (these require visual analysis - can't be detected from gaze alone)
+DEICTIC_GESTURES = {
+    "pointing": "Directing attention to an object or location by pointing",
+    "showing": "Presenting or displaying an object to another person",
+    "giving": "Offering or handing over an object to another person",
+    "reaching": "Extending arm to acquire or touch an object",
 }
+
+# Note: Social attention patterns (joint_attention, gaze_following, turn_taking, attention_capture)
+# are detected by gaze_feature_extractor.py and candidate_event_detector.py
+# Gemini's role is to VALIDATE those detections and identify accompanying deictic gestures
 
 
 @dataclass
 class GestureClassification:
     """Classification result for a candidate event."""
     event_id: int
-    gesture_category: str  # "deictic", "social_attention", "other"
-    gesture_type: str  # Specific gesture from taxonomy
-    confidence: float
-    description: str
+    # Binary validation of detected gaze event
+    event_confirmed: bool
+    rejection_reason: Optional[str]  # Only if rejected
+    # Deictic gesture detection
+    deictic_gesture_detected: bool
+    deictic_gesture_type: Optional[str]  # "pointing", "showing", "giving", "reaching"
     initiator_id: Optional[int]
+    # Gesture target (for QA: B2 task)
+    gesture_target_type: Optional[str]  # "person", "object", "location"
+    gesture_target_person_id: Optional[int]
+    gesture_target_description: Optional[str]
+    # Causality (for QA: C2 task)
+    caused_gaze_shift: bool
     responder_ids: List[int]
-    target_region: Optional[Tuple[float, float]]  # Normalized (x, y)
+    # Description
+    description: str
     raw_response: str
 
 
@@ -132,14 +133,20 @@ def extract_video_clip(
 
 def video_to_frames_base64(
     video_path: str,
+    start_sec: float = 0,
+    end_sec: float = None,
+    sample_fps: float = 2.0,
     max_frames: int = 10,
     resize: Tuple[int, int] = (640, 360),
 ) -> List[str]:
     """
-    Extract frames from video and convert to base64 for API.
+    Extract frames from video at target FPS and convert to base64 for API.
     
     Args:
         video_path: Path to video
+        start_sec: Start time in seconds
+        end_sec: End time in seconds (None = to end)
+        sample_fps: Target sampling FPS (default: 2.0 to match gaze annotation)
         max_frames: Maximum frames to extract
         resize: Resize frames to this size
     
@@ -147,13 +154,25 @@ def video_to_frames_base64(
         List of base64-encoded JPEG frames
     """
     cap = cv2.VideoCapture(video_path)
+    video_fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration = total_frames / video_fps if video_fps > 0 else 0
     
-    # Sample frames evenly
-    if total_frames <= max_frames:
-        frame_indices = list(range(total_frames))
-    else:
-        frame_indices = np.linspace(0, total_frames - 1, max_frames, dtype=int).tolist()
+    if end_sec is None:
+        end_sec = duration
+    
+    # Calculate frame indices at target sample_fps
+    frame_interval = video_fps / sample_fps  # e.g., 30fps/2fps = every 15th frame
+    
+    start_frame = int(start_sec * video_fps)
+    end_frame = min(int(end_sec * video_fps), total_frames - 1)
+    
+    # Sample frames at sample_fps
+    frame_indices = []
+    current_frame = start_frame
+    while current_frame <= end_frame and len(frame_indices) < max_frames:
+        frame_indices.append(int(current_frame))
+        current_frame += frame_interval
     
     frames_b64 = []
     
@@ -176,52 +195,65 @@ def video_to_frames_base64(
 
 def build_classification_prompt(event: Dict, gaze_context: Dict) -> str:
     """
-    Build a structured prompt for Gemini to classify the gesture.
+    Build a structured prompt for Gemini to validate and classify gestures.
     """
-    prompt = f"""Analyze these video frames for social gestures. This is research on non-verbal communication.
+    event_type = event.get('event_type', 'unknown')
+    persons = event.get('persons_involved', [])
+    
+    # Event type definitions
+    event_definitions = {
+        "sudden_gaze_shift": "A person suddenly changed where they're looking",
+        "joint_attention": "Multiple people looking at the same target",
+        "gaze_following": "One person looks where another person is looking",
+        "attention_capture": "One person's action caused others to look at them",
+        "mutual_gaze": "Two people looking at each other",
+    }
+    event_desc = event_definitions.get(event_type, event_type)
+    
+    prompt = f"""Analyze these video frames to validate a detected social interaction event.
 
-## Event Context
-- Event type detected by gaze analysis: {event.get('event_type', 'unknown')}
-- Time window: {event.get('start_time', 0):.2f}s - {event.get('end_time', 0):.2f}s
-- Persons involved (IDs): {event.get('persons_involved', [])}
-- Detection confidence: {event.get('confidence', 0):.2f}
+## About These Frames
+These frames have annotations drawn on them:
+- Colored bounding boxes with person labels (P0, P1, P2, etc.)
+- Lines showing where each person is looking (gaze direction)
 
-## Gaze Data
-{json.dumps(event.get('details', {}), indent=2)}
+## Event Detected by Gaze Analysis
+- Type: **{event_type}** = {event_desc}
+- Time: {event.get('start_time', 0):.2f}s - {event.get('end_time', 0):.2f}s
+- Persons involved: {persons}
 
-## Task
-Classify what social gesture (if any) is occurring in these frames.
+## Your Tasks
+1. **Validate**: Look at the gaze lines - do they support this {event_type} event?
+2. **Detect Deictic Gestures**: Did anyone point, show, give, or reach for something?
+3. **Identify Targets**: If gesture detected, what/who is the target?
+4. **Identify Causality**: Did any gesture cause others to shift their gaze?
 
-## Gesture Categories
-
-### Deictic Gestures:
-- **pointing**: Directing attention to object/location by pointing
-- **showing**: Presenting/displaying object to another person
-- **giving**: Offering/handing over object to another person
-- **reaching**: Extending arm to acquire or touch object
-
-### Social Attention Patterns:
-- **joint_attention**: Multiple people looking at same target
-- **gaze_following**: One person looking where another looked
-- **turn_taking**: Exchanging conversational floor
-- **attention_capture**: One person attracting attention of others
-
-### Other:
-- **no_gesture**: No clear social gesture
-- **unclear**: Cannot determine
+## Deictic Gestures:
+- **pointing**: Someone pointing at something
+- **showing**: Someone displaying an object
+- **giving**: Someone handing over an object
+- **reaching**: Someone reaching toward an object
 
 ## Response Format (JSON only):
 {{
-    "gesture_category": "deictic" | "social_attention" | "other",
-    "gesture_type": "<specific type from categories above>",
-    "confidence": <0.0-1.0>,
-    "description": "<brief description of what's happening>",
-    "initiator_id": <person ID who initiated, or null>,
-    "responder_ids": [<list of person IDs responding>],
-    "target_region": [<x>, <y>] or null (normalized 0-1 coordinates of gesture target)
+    "event_confirmed": true | false,
+    "rejection_reason": "<only if rejected>",
+    
+    "deictic_gesture_detected": true | false,
+    "deictic_gesture_type": "pointing" | "showing" | "giving" | "reaching" | null,
+    "initiator_id": <person ID who did the gesture, or null>,
+    
+    "gesture_target_type": "person" | "object" | null,
+    "gesture_target_person_id": <person ID if target is a person, else null>,
+    "gesture_target_description": "<what they're pointing at/showing, or null>",
+    
+    "caused_gaze_shift": true | false,
+    "responder_ids": [<person IDs who shifted gaze in response>],
+    
+    "description": "<what's happening>"
 }}
 
-Respond with ONLY the JSON object, no other text.
+Respond with ONLY the JSON object.
 """
     return prompt
 
@@ -288,9 +320,22 @@ def classify_events(
     api_key: Optional[str] = None,
     model_name: str = "gemini-2.0-flash",
     max_events: Optional[int] = None,
+    sample_fps: float = 2.0,
+    viz_video_path: Optional[str] = None,
 ) -> List[GestureClassification]:
     """
     Classify all candidate events using Gemini.
+    
+    Args:
+        video_path: Path to original video (used if viz_video_path not provided)
+        events: List of candidate events to classify
+        gaze_data: Gaze annotation data
+        api_key: Gemini API key
+        model_name: Gemini model to use
+        max_events: Maximum events to classify
+        sample_fps: FPS for frame extraction (default: 2.0 to match gaze annotation)
+        viz_video_path: Path to visualization video with annotations overlay.
+                        If None, will auto-detect by looking for *_viz.mp4 or *_sam3rf_viz.mp4
     """
     if api_key:
         genai.configure(api_key=api_key)
@@ -298,59 +343,83 @@ def classify_events(
     results = []
     events_to_process = events[:max_events] if max_events else events
     
+    # Try to find visualization video if not provided
+    if viz_video_path is None:
+        base_name = os.path.splitext(video_path)[0]
+        # Try common visualization video suffixes
+        for suffix in ['_viz.mp4', '_sam3rf_viz.mp4']:
+            candidate = base_name + suffix
+            if os.path.exists(candidate):
+                viz_video_path = candidate
+                print(f"Using visualization video: {viz_video_path}")
+                break
+    
+    # Use viz video if available, otherwise use raw video
+    source_video = viz_video_path if viz_video_path and os.path.exists(viz_video_path) else video_path
+    if source_video == video_path:
+        print(f"Using raw video (no visualization found): {video_path}")
+    
+    # Get video FPS for time conversion
+    cap = cv2.VideoCapture(source_video)
+    video_fps = cap.get(cv2.CAP_PROP_FPS)
+    cap.release()
+    
     for i, event in enumerate(events_to_process):
         print(f"Classifying event {i+1}/{len(events_to_process)}: {event.get('event_type')}")
         
-        # Extract video clip
-        clip_path = extract_video_clip(
-            video_path,
-            event["start_frame"],
-            event["end_frame"],
-            context_frames=5,
-            max_frames=20,
+        # Convert frame indices to time (use original frame indices from gaze annotation)
+        start_time = event["start_time"] - 1.0  # 1 second context before
+        end_time = event["end_time"] + 1.0  # 1 second context after
+        
+        # Extract frames from visualization video (has person IDs and gaze arrows drawn)
+        frames_b64 = video_to_frames_base64(
+            source_video,
+            start_sec=max(0, start_time),
+            end_sec=end_time,
+            sample_fps=sample_fps,
+            max_frames=10,  # ~5 seconds at 2fps
         )
         
-        try:
-            # Convert to frames
-            frames_b64 = video_to_frames_base64(clip_path, max_frames=8)
-            
-            # Build prompt
-            prompt = build_classification_prompt(event, gaze_data)
-            
-            # Query Gemini
-            raw_response, parsed = classify_with_gemini(frames_b64, prompt, model_name)
-            
-            if parsed:
-                result = GestureClassification(
-                    event_id=event.get("event_id", i),
-                    gesture_category=parsed.get("gesture_category", "other"),
-                    gesture_type=parsed.get("gesture_type", "unclear"),
-                    confidence=parsed.get("confidence", 0.0),
-                    description=parsed.get("description", ""),
-                    initiator_id=parsed.get("initiator_id"),
-                    responder_ids=parsed.get("responder_ids", []),
-                    target_region=tuple(parsed["target_region"]) if parsed.get("target_region") else None,
-                    raw_response=raw_response,
-                )
-            else:
-                result = GestureClassification(
-                    event_id=event.get("event_id", i),
-                    gesture_category="other",
-                    gesture_type="unclear",
-                    confidence=0.0,
-                    description="Failed to parse Gemini response",
-                    initiator_id=None,
-                    responder_ids=[],
-                    target_region=None,
-                    raw_response=raw_response,
-                )
-            
-            results.append(result)
-            
-        finally:
-            # Cleanup temp file
-            if os.path.exists(clip_path):
-                os.remove(clip_path)
+        # Build prompt
+        prompt = build_classification_prompt(event, gaze_data)
+        
+        # Query Gemini
+        raw_response, parsed = classify_with_gemini(frames_b64, prompt, model_name)
+        
+        if parsed:
+            result = GestureClassification(
+                event_id=event.get("event_id", i),
+                event_confirmed=parsed.get("event_confirmed", False),
+                rejection_reason=parsed.get("rejection_reason"),
+                deictic_gesture_detected=parsed.get("deictic_gesture_detected", False),
+                deictic_gesture_type=parsed.get("deictic_gesture_type"),
+                initiator_id=parsed.get("initiator_id"),
+                gesture_target_type=parsed.get("gesture_target_type"),
+                gesture_target_person_id=parsed.get("gesture_target_person_id"),
+                gesture_target_description=parsed.get("gesture_target_description"),
+                caused_gaze_shift=parsed.get("caused_gaze_shift", False),
+                responder_ids=parsed.get("responder_ids", []),
+                description=parsed.get("description", ""),
+                raw_response=raw_response,
+            )
+        else:
+            result = GestureClassification(
+                event_id=event.get("event_id", i),
+                event_confirmed=False,
+                rejection_reason="Failed to parse Gemini response",
+                deictic_gesture_detected=False,
+                deictic_gesture_type=None,
+                initiator_id=None,
+                gesture_target_type=None,
+                gesture_target_person_id=None,
+                gesture_target_description=None,
+                caused_gaze_shift=False,
+                responder_ids=[],
+                description="",
+                raw_response=raw_response,
+            )
+        
+        results.append(result)
     
     return results
 
@@ -361,29 +430,39 @@ def save_classifications(
     output_path: str,
 ) -> None:
     """Save classification results to JSON."""
+    # Count validation results and deictic gestures
+    confirmed_count = sum(1 for r in results if r.event_confirmed)
+    rejected_count = len(results) - confirmed_count
+    deictic_counts = {}
+    
+    for r in results:
+        if r.deictic_gesture_detected and r.deictic_gesture_type:
+            deictic_counts[r.deictic_gesture_type] = deictic_counts.get(r.deictic_gesture_type, 0) + 1
+    
     output = {
         "video_path": events_data.get("video_path"),
         "num_events_classified": len(results),
-        "gesture_counts": {},
+        "events_confirmed": confirmed_count,
+        "events_rejected": rejected_count,
+        "deictic_gestures_detected": deictic_counts,
         "classifications": [],
     }
-    
-    # Count gestures
-    for r in results:
-        key = f"{r.gesture_category}/{r.gesture_type}"
-        output["gesture_counts"][key] = output["gesture_counts"].get(key, 0) + 1
     
     # Convert to dicts
     for r in results:
         output["classifications"].append({
             "event_id": r.event_id,
-            "gesture_category": r.gesture_category,
-            "gesture_type": r.gesture_type,
-            "confidence": r.confidence,
-            "description": r.description,
+            "event_confirmed": r.event_confirmed,
+            "rejection_reason": r.rejection_reason,
+            "deictic_gesture_detected": r.deictic_gesture_detected,
+            "deictic_gesture_type": r.deictic_gesture_type,
             "initiator_id": r.initiator_id,
+            "gesture_target_type": r.gesture_target_type,
+            "gesture_target_person_id": r.gesture_target_person_id,
+            "gesture_target_description": r.gesture_target_description,
+            "caused_gaze_shift": r.caused_gaze_shift,
             "responder_ids": r.responder_ids,
-            "target_region": list(r.target_region) if r.target_region else None,
+            "description": r.description,
         })
     
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
@@ -440,13 +519,22 @@ def main():
     
     # Print summary
     print(f"\nClassification Summary:")
-    gesture_counts = {}
-    for r in results:
-        key = f"{r.gesture_category}/{r.gesture_type}"
-        gesture_counts[key] = gesture_counts.get(key, 0) + 1
     
-    for key, count in sorted(gesture_counts.items()):
-        print(f"  - {key}: {count}")
+    confirmed_count = sum(1 for r in results if r.event_confirmed)
+    rejected_count = len(results) - confirmed_count
+    deictic_counts = {}
+    
+    for r in results:
+        if r.deictic_gesture_detected and r.deictic_gesture_type:
+            deictic_counts[r.deictic_gesture_type] = deictic_counts.get(r.deictic_gesture_type, 0) + 1
+    
+    print(f"  Events confirmed: {confirmed_count}")
+    print(f"  Events rejected: {rejected_count}")
+    
+    if deictic_counts:
+        print("  Deictic Gestures Detected:")
+        for gesture, count in deictic_counts.items():
+            print(f"    - {gesture}: {count}")
     
     save_classifications(results, events_data, args.output_json)
 

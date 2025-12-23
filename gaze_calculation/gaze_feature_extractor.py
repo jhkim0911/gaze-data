@@ -51,11 +51,18 @@ class FrameGazeFeatures:
     num_persons: int
     num_faces_detected: int
     
-    # Per-person features
-    person_velocities: Dict[int, float]  # person_id -> velocity at this frame
+    # Per-person features (existing)
+    person_velocities: Dict[int, float]  # person_id -> velocity at this frame (RAW gaze point velocity)
     person_gaze_points: Dict[int, Optional[Tuple[float, float]]]  # normalized gaze
     person_gaze_confidences: Dict[int, float]  # person_id -> gaze confidence (1.0=measured, <1.0=interpolated)
     person_gaze_methods: Dict[int, str]  # person_id -> method (measured, linear_interpolation, carry_forward, etc.)
+    
+    # NEW: Anchor-based features (physics-based)
+    person_face_centers: Dict[int, Optional[Tuple[float, float]]]  # Anchor positions (face bbox center)
+    person_gaze_directions: Dict[int, Optional[Tuple[float, float]]]  # Gaze direction relative to face
+    person_face_velocities: Dict[int, Optional[float]]  # How fast face/person moved (for scene cut detection)
+    person_is_scene_cut: Dict[int, bool]  # Did scene cut occur for this person?
+    person_gaze_dir_velocities: Dict[int, Optional[float]]  # Gaze DIRECTION velocity (physics-correct)
     
     # Social features
     gaze_convergence_score: float  # How clustered are gaze points
@@ -130,6 +137,76 @@ def compute_convergence_score(gaze_points: List[Tuple[float, float]]) -> Tuple[f
     score = math.exp(-3.0 * mean_dist)
     
     return score, center
+
+
+# ============================================================================
+# Anchor-based Gaze Features (Physics-correct)
+# ============================================================================
+
+# Scene cut detection threshold (30% of frame = likely scene cut or camera change)
+SCENE_CUT_THRESHOLD = 0.3
+
+# Maximum frame gap for computing velocity (gaps > 1 frame may indicate scene change)
+MAX_VELOCITY_FRAME_GAP = 1
+
+
+def compute_bbox_center(bbox: Tuple[float, float, float, float]) -> Tuple[float, float]:
+    """
+    Compute center of normalized bbox (x1, y1, x2, y2).
+    
+    Args:
+        bbox: (x1, y1, x2, y2) in normalized coordinates [0, 1]
+    
+    Returns:
+        (center_x, center_y) in normalized coordinates
+    """
+    return ((bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2)
+
+
+def compute_gaze_direction(
+    gaze_point: Tuple[float, float], 
+    face_center: Tuple[float, float]
+) -> Tuple[float, float]:
+    """
+    Compute gaze direction vector from face to gaze point.
+    
+    This is the "relative gaze" that tells where the person is looking
+    independent of their position in the frame.
+    
+    Args:
+        gaze_point: Where the person is looking (normalized)
+        face_center: Where the person's face is (normalized)
+    
+    Returns:
+        (dx, dy) direction vector from face to gaze point
+    """
+    return (gaze_point[0] - face_center[0], gaze_point[1] - face_center[1])
+
+
+def is_scene_cut(
+    face_center_prev: Tuple[float, float],
+    face_center_curr: Tuple[float, float],
+    threshold: float = SCENE_CUT_THRESHOLD
+) -> bool:
+    """
+    Detect if face jumped (scene cut, camera change, or person teleported).
+    
+    In continuous video, a person's face doesn't move more than ~10-20% of frame
+    between adjacent frames. Larger jumps indicate discontinuity.
+    
+    Args:
+        face_center_prev: Face center in previous frame
+        face_center_curr: Face center in current frame
+        threshold: Maximum displacement before flagging as scene cut
+    
+    Returns:
+        True if displacement exceeds threshold (likely scene cut)
+    """
+    displacement = math.sqrt(
+        (face_center_curr[0] - face_center_prev[0])**2 +
+        (face_center_curr[1] - face_center_prev[1])**2
+    )
+    return displacement > threshold
 
 
 # ============================================================================
@@ -428,6 +505,97 @@ def extract_gaze_features(gaze_data: Dict) -> GazeFeaturesResult:
     frame_features: List[FrameGazeFeatures] = []
     frame_idx_to_velocity_idx: Dict[int, int] = {}  # Map frame index to velocity array index
     
+    # NEW: Build per-person anchor history (face_center per frame) for physics-based velocity
+    person_anchor_history: Dict[int, List[Dict]] = {}  # pid -> [{frame_idx, timestamp, face_center, gaze_point, gaze_direction}, ...]
+    
+    for idx, frame_data in enumerate(frames):
+        frame_idx = frame_data["frame_idx"]
+        timestamp = frame_data["timestamp"]
+        
+        for person in frame_data["persons"]:
+            pid = person["person_id"]
+            
+            if pid not in person_anchor_history:
+                person_anchor_history[pid] = []
+            
+            # Extract face center (anchor) if face detected
+            face_center = None
+            if person.get("face_detected") and person.get("face_bbox"):
+                face_bbox = person["face_bbox"]
+                face_center = compute_bbox_center(tuple(face_bbox))
+            
+            # Get gaze point
+            gaze_point = None
+            interp_history = person_gaze_interpolated.get(pid, [])
+            if idx < len(interp_history):
+                interp_data = interp_history[idx]
+                gaze_point = interp_data["gaze_point"]
+            
+            # Compute gaze direction (relative to face) if both available
+            gaze_direction = None
+            if face_center and gaze_point:
+                gaze_direction = compute_gaze_direction(gaze_point, face_center)
+            
+            person_anchor_history[pid].append({
+                "frame_list_idx": idx,
+                "frame_idx": frame_idx,
+                "timestamp": timestamp,
+                "face_center": face_center,
+                "gaze_point": gaze_point,
+                "gaze_direction": gaze_direction,
+            })
+    
+    # Compute anchor-based velocities for each person
+    person_anchor_velocities: Dict[int, List[Dict]] = {}  # pid -> [{frame_idx, face_vel, gaze_dir_vel, is_scene_cut}, ...]
+    
+    for pid, history in person_anchor_history.items():
+        velocities = []
+        for i in range(len(history)):
+            curr = history[i]
+            result = {
+                "frame_idx": curr["frame_idx"],
+                "face_velocity": None,
+                "gaze_dir_velocity": None,
+                "is_scene_cut": False,
+            }
+            
+            if i == 0:
+                # First frame - no velocity
+                velocities.append(result)
+                continue
+            
+            prev = history[i - 1]
+            dt = curr["timestamp"] - prev["timestamp"]
+            
+            # Check if we can compute velocity
+            if prev["face_center"] is None or curr["face_center"] is None:
+                # Missing anchor - can't compute
+                velocities.append(result)
+                continue
+            
+            # Compute face displacement
+            face_disp = compute_gaze_distance(prev["face_center"], curr["face_center"])
+            
+            # Check for scene cut
+            if is_scene_cut(prev["face_center"], curr["face_center"]):
+                result["is_scene_cut"] = True
+                velocities.append(result)
+                continue
+            
+            # Compute face velocity
+            result["face_velocity"] = face_disp / dt if dt > 0 else 0.0
+            result["is_scene_cut"] = False
+            
+            # Compute gaze direction velocity (physics-correct!)
+            if prev["gaze_direction"] and curr["gaze_direction"]:
+                gaze_dir_disp = compute_gaze_distance(prev["gaze_direction"], curr["gaze_direction"])
+                result["gaze_dir_velocity"] = gaze_dir_disp / dt if dt > 0 else 0.0
+            
+            velocities.append(result)
+        
+        person_anchor_velocities[pid] = velocities
+    
+    # Now build frame features with all the new data
     for idx, frame_data in enumerate(frames):
         frame_idx = frame_data["frame_idx"]
         timestamp = frame_data["timestamp"]
@@ -441,6 +609,13 @@ def extract_gaze_features(gaze_data: Dict) -> GazeFeaturesResult:
         person_gaze_confidences = {}
         person_gaze_methods = {}
         person_velocities_frame = {}
+        
+        # NEW: Anchor-based features
+        person_face_centers = {}
+        person_gaze_directions = {}
+        person_face_velocities = {}
+        person_is_scene_cut = {}
+        person_gaze_dir_velocities = {}
         
         for person in persons:
             pid = person["person_id"]
@@ -457,12 +632,32 @@ def extract_gaze_features(gaze_data: Dict) -> GazeFeaturesResult:
                 person_gaze_confidences[pid] = 0.0
                 person_gaze_methods[pid] = "missing"
             
-            # Get velocity at this frame
+            # Get RAW velocity at this frame (original method)
             vel_history = person_velocities_over_time.get(pid, [])
             if idx > 0 and idx - 1 < len(vel_history):
                 person_velocities_frame[pid] = vel_history[idx - 1][1]  # [1] is velocity
             else:
                 person_velocities_frame[pid] = 0.0
+            
+            # Get anchor-based features
+            anchor_history = person_anchor_history.get(pid, [])
+            anchor_velocities = person_anchor_velocities.get(pid, [])
+            
+            if idx < len(anchor_history):
+                person_face_centers[pid] = anchor_history[idx]["face_center"]
+                person_gaze_directions[pid] = anchor_history[idx]["gaze_direction"]
+            else:
+                person_face_centers[pid] = None
+                person_gaze_directions[pid] = None
+            
+            if idx < len(anchor_velocities):
+                person_face_velocities[pid] = anchor_velocities[idx]["face_velocity"]
+                person_is_scene_cut[pid] = anchor_velocities[idx]["is_scene_cut"]
+                person_gaze_dir_velocities[pid] = anchor_velocities[idx]["gaze_dir_velocity"]
+            else:
+                person_face_velocities[pid] = None
+                person_is_scene_cut[pid] = False
+                person_gaze_dir_velocities[pid] = None
         
         # Compute weighted convergence (uses confidence)
         gaze_list = [person_gaze_points[pid] for pid in person_gaze_points]
@@ -491,6 +686,13 @@ def extract_gaze_features(gaze_data: Dict) -> GazeFeaturesResult:
             person_gaze_points=person_gaze_points,
             person_gaze_confidences=person_gaze_confidences,
             person_gaze_methods=person_gaze_methods,
+            # NEW fields:
+            person_face_centers=person_face_centers,
+            person_gaze_directions=person_gaze_directions,
+            person_face_velocities=person_face_velocities,
+            person_is_scene_cut=person_is_scene_cut,
+            person_gaze_dir_velocities=person_gaze_dir_velocities,
+            # Social features:
             gaze_convergence_score=conv_score,
             gaze_convergence_center=conv_center,
             pairwise_distances=pairwise_distances,

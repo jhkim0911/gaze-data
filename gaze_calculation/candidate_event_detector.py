@@ -10,6 +10,7 @@ Event types detected:
 2. Joint Attention - Multiple people looking at same region
 3. Gaze Following - Person B looks where Person A looked with temporal lag
 4. Attention Capture - Sudden multi-person gaze shift
+5. Mutual Gaze - Two people looking at each other (eye contact)
 
 Usage:
     python candidate_event_detector.py --input_features /path/to/features.json --output_json /path/to/events.json
@@ -389,6 +390,135 @@ def detect_attention_capture(
     return events
 
 
+def detect_mutual_gaze(
+    frame_features: List[Dict],
+    distance_threshold: float = 0.15,  # How close gaze must be to other person's face
+    min_duration_sec: float = 0.5,
+    min_confidence: float = 0.5,
+) -> List[CandidateEvent]:
+    """
+    Detect mutual gaze events where two people look at each other (eye contact).
+    
+    Logic:
+    - Person A's gaze_point is near Person B's face_center
+    - AND Person B's gaze_point is near Person A's face_center
+    - Both conditions sustained for min_duration_sec
+    
+    These indicate:
+    - Direct social interaction
+    - Conversation engagement
+    - Non-verbal communication
+    """
+    events = []
+    event_id = 4000  # Start from 4000 for mutual gaze events
+    
+    # Build per-frame mutual gaze candidates
+    mutual_gaze_frames: Dict[str, List[Dict]] = {}  # "pidA_pidB" -> list of frames
+    
+    for ff in frame_features:
+        face_centers = ff.get("person_face_centers", {})
+        gaze_points = ff.get("person_gaze_points", {})
+        gaze_confidences = ff.get("person_gaze_confidences", {})
+        
+        # Get all person IDs with valid face_center and gaze_point
+        valid_persons = []
+        for pid_str in face_centers.keys():
+            pid = int(pid_str)
+            face_center = face_centers.get(str(pid)) or face_centers.get(pid)
+            gaze_point = gaze_points.get(str(pid)) or gaze_points.get(pid)
+            gaze_conf = gaze_confidences.get(str(pid), gaze_confidences.get(pid, 0))
+            
+            if face_center and gaze_point and gaze_conf >= min_confidence:
+                valid_persons.append({
+                    "pid": pid,
+                    "face_center": face_center,
+                    "gaze_point": gaze_point,
+                })
+        
+        # Check all pairs for mutual gaze
+        for i, person_a in enumerate(valid_persons):
+            for person_b in valid_persons[i+1:]:
+                pid_a = person_a["pid"]
+                pid_b = person_b["pid"]
+                
+                # Check if A looks at B's face
+                dist_a_to_b = np.sqrt(
+                    (person_a["gaze_point"][0] - person_b["face_center"][0])**2 +
+                    (person_a["gaze_point"][1] - person_b["face_center"][1])**2
+                )
+                
+                # Check if B looks at A's face
+                dist_b_to_a = np.sqrt(
+                    (person_b["gaze_point"][0] - person_a["face_center"][0])**2 +
+                    (person_b["gaze_point"][1] - person_a["face_center"][1])**2
+                )
+                
+                # Both must be looking at each other
+                if dist_a_to_b < distance_threshold and dist_b_to_a < distance_threshold:
+                    pair_key = f"{min(pid_a, pid_b)}_{max(pid_a, pid_b)}"
+                    if pair_key not in mutual_gaze_frames:
+                        mutual_gaze_frames[pair_key] = []
+                    
+                    mutual_gaze_frames[pair_key].append({
+                        "frame_idx": ff["frame_idx"],
+                        "timestamp": ff["timestamp"],
+                        "dist_a_to_b": dist_a_to_b,
+                        "dist_b_to_a": dist_b_to_a,
+                        "persons": [pid_a, pid_b],
+                    })
+    
+    # Cluster consecutive mutual gaze frames into events
+    for pair_key, frames in mutual_gaze_frames.items():
+        if not frames:
+            continue
+        
+        frames = sorted(frames, key=lambda x: x["timestamp"])
+        
+        clusters = []
+        current_cluster = [frames[0]]
+        
+        for i in range(1, len(frames)):
+            if frames[i]["timestamp"] - frames[i-1]["timestamp"] < 0.6:
+                current_cluster.append(frames[i])
+            else:
+                if current_cluster:
+                    clusters.append(current_cluster)
+                current_cluster = [frames[i]]
+        
+        if current_cluster:
+            clusters.append(current_cluster)
+        
+        # Create events from clusters
+        for cluster in clusters:
+            duration = cluster[-1]["timestamp"] - cluster[0]["timestamp"]
+            
+            if duration >= min_duration_sec:
+                mean_dist = np.mean([
+                    (f["dist_a_to_b"] + f["dist_b_to_a"]) / 2 
+                    for f in cluster
+                ])
+                confidence = max(0, 1.0 - (mean_dist / distance_threshold))
+                
+                events.append(CandidateEvent(
+                    event_id=event_id,
+                    event_type="mutual_gaze",
+                    start_time=cluster[0]["timestamp"],
+                    end_time=cluster[-1]["timestamp"],
+                    start_frame=cluster[0]["frame_idx"],
+                    end_frame=cluster[-1]["frame_idx"],
+                    confidence=confidence,
+                    persons_involved=cluster[0]["persons"],
+                    details={
+                        "duration": duration,
+                        "mean_gaze_distance": mean_dist,
+                        "num_frames": len(cluster),
+                    }
+                ))
+                event_id += 1
+    
+    return events
+
+
 def detect_all_events(features_data: Dict) -> List[CandidateEvent]:
     """Run all event detectors and merge results."""
     frame_features = features_data.get("frame_features", [])
@@ -406,6 +536,9 @@ def detect_all_events(features_data: Dict) -> List[CandidateEvent]:
     
     print("Detecting attention capture...")
     all_events.extend(detect_attention_capture(frame_features))
+    
+    print("Detecting mutual gaze...")
+    all_events.extend(detect_mutual_gaze(frame_features))
     
     # Sort by start time
     all_events.sort(key=lambda e: e.start_time)

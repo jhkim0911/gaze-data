@@ -32,8 +32,8 @@ logger = logging.getLogger(__name__)
 @dataclass
 class SegmentConfig:
     """Configuration for video segmentation."""
-    min_segment_seconds: int = 60  # Minimum segment length in seconds
-    max_segment_seconds: int = 180  # Maximum segment length in seconds (3 minutes)
+    min_segment_seconds: int = 45  # Minimum segment length in seconds
+    max_segment_seconds: int = 60  # Maximum segment length in seconds (1 minutes)
     adaptive_threshold: float = 3.0  # AdaptiveDetector threshold
     min_content_val: float = 15.0  # Minimum content difference to detect a scene
 
@@ -41,9 +41,7 @@ class SegmentConfig:
 def get_video_fps(video_path: str) -> float:
     """Get the FPS of a video file."""
     video = open_video(video_path)
-    fps = video.frame_rate
-    video.release()
-    return fps
+    return video.frame_rate
 
 
 def enforce_max_segment_length(
@@ -140,7 +138,6 @@ def segment_video(
         video = open_video(input_path)
         total_frames = video.duration.get_frames()
         scenes = [(FrameTimecode(0, fps=fps), FrameTimecode(total_frames, fps=fps))]
-        video.release()
     
     logger.info(f"Detected {len(scenes)} initial scenes")
     
@@ -155,7 +152,7 @@ def segment_video(
     
     # Split video using ffmpeg
     video_name = Path(input_path).stem
-    output_template = f"{video_name}_segment_$SCENE_NUMBER.mp4"
+    output_template = f"{video_name}_$SCENE_NUMBER.mp4"
     
     logger.info(f"Splitting video into {len(scenes)} segments...")
     split_video_ffmpeg(
@@ -229,60 +226,40 @@ def process_directory(
 
 
 def main():
-    """Main function to process TVQA and SocialGesture videos."""
+    """Main function to process videos with CLI argument support."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Segment videos using PySceneDetect')
+    parser.add_argument('--input', '-i', type=str, required=True, help='Input directory containing videos')
+    parser.add_argument('--output', '-o', type=str, required=True, help='Output directory for segments')
+    parser.add_argument('--min-segment', type=int, default=40, help='Minimum segment length in seconds (default: 40)')
+    parser.add_argument('--max-segment', type=int, default=120, help='Maximum segment length in seconds (default: 120)')
+    args = parser.parse_args()
     
     config = SegmentConfig(
-        min_segment_seconds=60,   # 60 seconds minimum
-        max_segment_seconds=180,  # 3 minutes maximum
+        min_segment_seconds=args.min_segment,
+        max_segment_seconds=args.max_segment,
     )
     
-    # ==========================================================================
-    # TVQA Videos
-    # ==========================================================================
-    tvqa_input_dir = "/projects/illinois/eng/cs/jrehg/users/arkimjh/gaze_social/tvqa/mp4_videos"
-    tvqa_output_dir = "/projects/illinois/eng/cs/jrehg/users/arkimjh/gaze_social/tvqa/video_segments"
+    logger.info("=" * 60)
+    logger.info(f"Processing videos from: {args.input}")
+    logger.info(f"Output directory: {args.output}")
+    logger.info(f"Segment length: {args.min_segment}s - {args.max_segment}s")
+    logger.info("=" * 60)
     
-    if Path(tvqa_input_dir).exists():
-        logger.info("=" * 60)
-        logger.info("Processing TVQA videos...")
-        logger.info("=" * 60)
-        
-        tvqa_results = process_directory(
-            input_dir=tvqa_input_dir,
-            output_dir=tvqa_output_dir,
-            config=config,
-            preserve_structure=True
-        )
-        
-        success_count = sum(1 for v in tvqa_results.values() if v is not None)
-        logger.info(f"TVQA: Processed {success_count}/{len(tvqa_results)} videos successfully")
-    else:
-        logger.warning(f"TVQA input directory not found: {tvqa_input_dir}")
+    if not Path(args.input).exists():
+        logger.error(f"Input directory not found: {args.input}")
+        return
     
-    # ==========================================================================
-    # SocialGesture Videos
-    # ==========================================================================
-    # NOTE: Update this path if the SocialGesture videos are in a different location
-    socialgesture_input_dir = "/projects/illinois/eng/cs/jrehg/datasets-social/SocialGesture/socialgesture_5fps_videos"
-    socialgesture_output_dir = "/projects/illinois/eng/cs/jrehg/users/arkimjh/gaze_social/social_gesture/video_segments"
+    results = process_directory(
+        input_dir=args.input,
+        output_dir=args.output,
+        config=config,
+        preserve_structure=True
+    )
     
-    if Path(socialgesture_input_dir).exists():
-        logger.info("=" * 60)
-        logger.info("Processing SocialGesture videos...")
-        logger.info("=" * 60)
-        
-        socialgesture_results = process_directory(
-            input_dir=socialgesture_input_dir,
-            output_dir=socialgesture_output_dir,
-            config=config,
-            preserve_structure=True
-        )
-        
-        success_count = sum(1 for v in socialgesture_results.values() if v is not None)
-        logger.info(f"SocialGesture: Processed {success_count}/{len(socialgesture_results)} videos successfully")
-    else:
-        logger.warning(f"SocialGesture input directory not found: {socialgesture_input_dir}")
-        logger.warning("To process SocialGesture videos, update the path in main() or use process_directory() directly")
+    success_count = sum(1 for v in results.values() if v is not None)
+    logger.info(f"Processed {success_count}/{len(results)} videos successfully")
 
 
 if __name__ == "__main__":

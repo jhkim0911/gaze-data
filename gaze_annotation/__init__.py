@@ -4,7 +4,9 @@
 from .sam3_retinaface_gaze_pipeline import (
     Sam3PersonTracker,
     RetinaFaceDetector,
-    GazeAnywhereEstimator,
+    GazePredictor,
     PersonGazeResult,
+    Sam3RetinaFaceGazeAnnotator,
+    visualize_annotations,
 )
 from .retinaface_perframe_pipeline import RetinaFacePerFrameAnnotator
