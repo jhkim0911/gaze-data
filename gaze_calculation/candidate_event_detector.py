@@ -81,16 +81,24 @@ def detect_sudden_gaze_shifts(
     person_high_vel_frames: Dict[int, List[Dict]] = {}
     
     for ff in frame_features:
+        # Get persons who are ACTUALLY PRESENT (have valid face bbox, not None)
+        face_bboxes = ff.get("person_face_bboxes", {})
+        present_persons = set(k for k, v in face_bboxes.items() if v is not None)
+        
         for pid, vel in ff.get("person_velocities", {}).items():
-            pid = int(pid)
+            pid_int = int(pid)
+            # Only include if person is actually present in frame
+            if str(pid) not in present_persons:
+                continue
             if vel > velocity_threshold:
-                if pid not in person_high_vel_frames:
-                    person_high_vel_frames[pid] = []
-                person_high_vel_frames[pid].append({
+                if pid_int not in person_high_vel_frames:
+                    person_high_vel_frames[pid_int] = []
+                person_high_vel_frames[pid_int].append({
                     "frame_idx": ff["frame_idx"],
                     "timestamp": ff["timestamp"],
                     "velocity": vel,
                 })
+
     
     # Cluster consecutive high-velocity frames into events
     for pid, frames in person_high_vel_frames.items():
@@ -169,6 +177,12 @@ def detect_joint_attention(
         num_faces = ff.get("num_faces_detected", 0)
         
         if conv_score >= convergence_threshold and num_faces >= min_persons:
+            # Use person_face_bboxes as source of truth for who is actually in the frame
+            # (not person_gaze_points which may include interpolated data for absent people)
+            # Only include persons with non-null bbox (actually present)
+            face_bboxes = ff.get("person_face_bboxes", {})
+            present_persons = set(k for k, v in face_bboxes.items() if v is not None)
+            
             high_conv_frames.append({
                 "frame_idx": ff["frame_idx"],
                 "timestamp": ff["timestamp"],
@@ -176,6 +190,7 @@ def detect_joint_attention(
                 "center": ff.get("gaze_convergence_center"),
                 "num_persons": num_faces,
                 "person_gaze_points": ff.get("person_gaze_points", {}),
+                "present_persons": present_persons,  # People actually in frame
             })
     
     if not high_conv_frames:
@@ -208,32 +223,35 @@ def detect_joint_attention(
             mean_conv = np.mean([f["convergence_score"] for f in cluster])
             max_conv = max(f["convergence_score"] for f in cluster)
             
-            # Find the peak convergence frame (most representative)
+            # Find the peak convergence frame for convergence center
             peak_frame = max(cluster, key=lambda f: f["convergence_score"])
             
-            # Get persons from peak frame only (not accumulated across all frames)
-            all_persons = set()
-            for pid, gaze in peak_frame.get("person_gaze_points", {}).items():
-                if gaze is not None:
-                    all_persons.add(int(pid))
+            # Use START frame for person selection (who was present when event started)
+            start_frame = cluster[0]
+            present_persons = start_frame.get("present_persons", set())
             
-            # Get convergence center from peak frame
+            # Get convergence center from peak frame (most representative)
             avg_center = peak_frame.get("center")
             
-            # Filter to only persons converging toward the center
+            # Filter to only persons who are PRESENT in START FRAME and converging
+            all_persons = set()
             if avg_center:
-                converging_persons = set()
                 DIST_THRESHOLD = 0.2  # 20% of frame
                 
-                for pid, gaze in peak_frame.get("person_gaze_points", {}).items():
+                # Use gaze points from START frame, not peak frame
+                for pid, gaze in start_frame.get("person_gaze_points", {}).items():
+                    pid_str = str(pid)
+                    # Only include if person is actually present in start frame
+                    if pid_str not in present_persons and str(int(pid)) not in present_persons:
+                        continue
                     if gaze is not None:
                         dist = np.sqrt((gaze[0] - avg_center[0])**2 + (gaze[1] - avg_center[1])**2)
                         if dist < DIST_THRESHOLD:
-                            converging_persons.add(int(pid))
-                
-                # Only use converging persons if we have at least min_persons
-                if len(converging_persons) >= min_persons:
-                    all_persons = converging_persons
+                            all_persons.add(int(pid))
+            
+            # Skip if not enough present persons converging
+            if len(all_persons) < min_persons:
+                continue
             
             events.append(CandidateEvent(
                 event_id=event_id,
@@ -391,9 +409,13 @@ def detect_attention_capture(
     multi_shift_frames = []
     
     for ff in frame_features:
+        # Get persons who are ACTUALLY PRESENT (have valid face bbox, not None)
+        face_bboxes = ff.get("person_face_bboxes", {})
+        present_persons = set(k for k, v in face_bboxes.items() if v is not None)
+        
         high_vel_persons = [
             int(pid) for pid, vel in ff.get("person_velocities", {}).items()
-            if vel > velocity_threshold
+            if vel > velocity_threshold and str(pid) in present_persons
         ]
         
         if len(high_vel_persons) >= min_persons:
@@ -402,10 +424,12 @@ def detect_attention_capture(
                 "timestamp": ff["timestamp"],
                 "persons": high_vel_persons,
                 "velocities": {int(k): v for k, v in ff.get("person_velocities", {}).items()},
+                "present_persons": present_persons,
             })
     
     if not multi_shift_frames:
         return events
+
     
     # Cluster by time
     multi_shift_frames = sorted(multi_shift_frames, key=lambda x: x["timestamp"])
@@ -425,14 +449,17 @@ def detect_attention_capture(
         clusters.append(current_cluster)
     
     for cluster in clusters:
-        all_persons = set()
-        all_velocities = {}
+        # Use only persons from the START frame (actually present when event begins)
+        start_frame = cluster[0]
+        all_persons = set(start_frame["persons"])
         
+        # Aggregate velocities for statistics (but persons list is anchored to start)
+        all_velocities = {}
         for f in cluster:
-            all_persons.update(f["persons"])
             for pid, vel in f["velocities"].items():
                 if pid not in all_velocities or vel > all_velocities[pid]:
                     all_velocities[pid] = vel
+
         
         if len(all_persons) >= min_persons:
             mean_vel = np.mean(list(all_velocities.values()))

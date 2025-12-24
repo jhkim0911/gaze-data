@@ -661,17 +661,21 @@ def extract_gaze_features(gaze_data: Dict) -> GazeFeaturesResult:
         for person in persons:
             pid = person["person_id"]
             
-            # Get gaze data directly from current frame's person data
-            # (more reliable than interpolation history index which may mismatch)
-            if person.get("gaze_point") and person.get("inout") is True:
+            # IMPORTANT: Only include gaze data for persons with face_detected=True
+            # Skip interpolated gaze for persons without face bbox (not actually in frame)
+            if not person.get("face_detected"):
+                # Still need to add to dicts with None for consistency, but mark as not present
+                person_gaze_points[pid] = None
+                person_gaze_confidences[pid] = 0.0
+                person_gaze_methods[pid] = "no_face"
+            elif person.get("gaze_point") and person.get("inout") is True:
+                # Valid face detected AND valid gaze point
                 person_gaze_points[pid] = tuple(person["gaze_point"])
                 person_gaze_confidences[pid] = 1.0
                 person_gaze_methods[pid] = "measured"
             else:
-                # Try to get from interpolation history for missing/OOF frames
-                # (Useful for static videos where gaze is temporarily lost)
+                # Face detected but no valid gaze - try interpolation for temporary loss
                 interp_history = person_gaze_interpolated.get(pid, [])
-                # Look up by timestamp (more reliable than index)
                 found = False
                 for idata in interp_history:
                     if abs(idata.get("timestamp", 0) - timestamp) < 0.01:
@@ -731,15 +735,21 @@ def extract_gaze_features(gaze_data: Dict) -> GazeFeaturesResult:
                 person_gaze_dir_velocities[pid] = None
         
         # Compute weighted convergence (uses confidence)
-        gaze_list = [person_gaze_points[pid] for pid in person_gaze_points]
-        conf_list = [person_gaze_confidences[pid] for pid in person_gaze_points]
+        # IMPORTANT: Only include persons with valid face_bbox (actually present in frame)
+        # Don't use interpolated gaze from absent persons
+        present_pids = [pid for pid in person_gaze_points 
+                        if person_face_bboxes.get(pid) is not None]
+        gaze_list = [person_gaze_points[pid] for pid in present_pids]
+        conf_list = [person_gaze_confidences[pid] for pid in present_pids]
         conv_score, conv_center = compute_weighted_convergence_score(gaze_list, conf_list)
         
-        # Compute pairwise distances (only for gaze with confidence >= 0.3)
+        # Compute pairwise distances (only for persons actually present with good confidence)
         pairwise_distances = {}
-        person_ids = [p["person_id"] for p in persons]
-        for i, pid1 in enumerate(person_ids):
-            for pid2 in person_ids[i+1:]:
+        # Only use persons with valid face_bbox
+        present_person_ids = [p["person_id"] for p in persons 
+                              if person_face_bboxes.get(p["person_id"]) is not None]
+        for i, pid1 in enumerate(present_person_ids):
+            for pid2 in present_person_ids[i+1:]:
                 g1 = person_gaze_points.get(pid1)
                 g2 = person_gaze_points.get(pid2)
                 c1 = person_gaze_confidences.get(pid1, 0)
