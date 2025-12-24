@@ -28,6 +28,13 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
+# Load .env file if present
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv not installed, use env vars directly
+
 try:
     import google.generativeai as genai
     GEMINI_AVAILABLE = True

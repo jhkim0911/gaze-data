@@ -70,34 +70,30 @@ def draw_event_overlay(
 ) -> np.ndarray:
     """Draw event information overlay on frame.
     
-    Note: The input viz video already has Frame/time/persons info in top-left,
-    so we only add event info in top-right to avoid duplication.
+    Note: The input viz video already has Frame/time/persons info in top-left
+    (roughly y=0-50), so we position event info below that starting at y=60.
     """
     h, w = frame.shape[:2]
     
     if not events:
         return frame
     
-    # Calculate box height based on content
-    box_h = 30
-    for event in events:
-        box_h += 35
-        event_id = event.get("event_id")
-        if classifications and event_id in classifications:
-            box_h += 60  # Extra space for Gemini info
+    # Calculate box height (single line per event: 22px each + padding)
+    box_h = 15 + len(events) * 22
     
-    # Draw event box in top-right
-    box_x = w - 320
-    box_y = 10
+    # Draw event box in top-left, below existing text (starts at y=60)
+    box_x = 10
+    box_y = 60  # Below the Frame/time/persons text
+    box_w = 300
     
     # Semi-transparent background
     overlay = frame.copy()
-    cv2.rectangle(overlay, (box_x, box_y), (w - 10, box_y + box_h), (0, 0, 0), -1)
+    cv2.rectangle(overlay, (box_x, box_y), (box_x + box_w, box_y + box_h), (0, 0, 0), -1)
     frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
     
-    y_pos = box_y + 25
+    y_pos = box_y + 20
     
-    # Draw each event
+    # Draw each event (compact single-line format)
     for event in events:
         event_type = event.get("event_type", "unknown")
         persons = event.get("persons_involved", [])
@@ -106,83 +102,31 @@ def draw_event_overlay(
         color = EVENT_COLORS.get(event_type, (255, 255, 255))
         label = EVENT_SHORT_LABELS.get(event_type, event_type.upper())
         
-        # Event type with colored indicator
-        cv2.circle(frame, (box_x + 15, y_pos - 5), 8, color, -1)
-        cv2.putText(
-            frame, label,
-            (box_x + 30, y_pos),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA
-        )
+        # Build compact single-line text: ● JOINT_ATTN P0,P1 [✓]
+        persons_text = f"P{','.join(map(str, persons))}" if persons else ""
         
-        # Persons involved
-        persons_text = f"P{', P'.join(map(str, persons))}" if persons else ""
-        cv2.putText(
-            frame, persons_text,
-            (box_x + 180, y_pos),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA
-        )
-        
-        y_pos += 25
-        
-        # Add Gemini classification info if available
+        # Check Gemini validation status
+        status = ""
         if classifications and event_id in classifications:
             cls = classifications[event_id]
-            
-            # Validation status
-            confirmed = cls.get("event_confirmed", False)
-            status_color = (0, 255, 0) if confirmed else (0, 0, 255)
-            status_text = "✓ CONFIRMED" if confirmed else "✗ REJECTED"
-            cv2.putText(
-                frame, status_text,
-                (box_x + 30, y_pos),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 1, cv2.LINE_AA
-            )
-            y_pos += 20
-            
-            # Deictic gesture
-            if cls.get("deictic_gesture_detected"):
-                gesture_type = cls.get("deictic_gesture_type", "")
-                initiator = cls.get("initiator_id")
-                gesture_text = f"GESTURE: {gesture_type}"
-                if initiator is not None:
-                    gesture_text += f" by P{initiator}"
-                cv2.putText(
-                    frame, gesture_text,
-                    (box_x + 30, y_pos),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA
-                )
-                y_pos += 20
-                
-                # Target info
-                target_type = cls.get("gesture_target_type")
-                if target_type == "person":
-                    target_id = cls.get("gesture_target_person_id")
-                    cv2.putText(
-                        frame, f"→ P{target_id}",
-                        (box_x + 30, y_pos),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 1, cv2.LINE_AA
-                    )
-                elif target_type == "object":
-                    target_desc = cls.get("gesture_target_description", "")[:20]
-                    cv2.putText(
-                        frame, f"→ {target_desc}",
-                        (box_x + 30, y_pos),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 200, 0), 1, cv2.LINE_AA
-                    )
-                y_pos += 20
-            
-            # Responders
-            responders = cls.get("responder_ids", [])
-            if responders:
-                resp_text = f"Responders: P{', P'.join(map(str, responders))}"
-                cv2.putText(
-                    frame, resp_text,
-                    (box_x + 30, y_pos),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 255), 1, cv2.LINE_AA
-                )
-                y_pos += 20
+            if cls.get("event_confirmed"):
+                status = "[✓]"
+            else:
+                status = "[✗]"
         
-        y_pos += 10  # Gap between events
+        line_text = f"{label} {persons_text} {status}"
+        
+        # Colored indicator circle
+        cv2.circle(frame, (box_x + 10, y_pos - 4), 6, color, -1)
+        
+        # Event text
+        cv2.putText(
+            frame, line_text,
+            (box_x + 22, y_pos),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA
+        )
+        
+        y_pos += 22
     
     return frame
 
@@ -291,14 +235,16 @@ def _reencode_h264(video_path: str) -> None:
 
 def batch_visualize(
     video_dir: str,
+    events_dir: str,
     output_dir: str,
 ) -> None:
     """
     Batch process all visualization videos in a directory.
     
-    Expects files like:
-    - *_sam3rf_viz.mp4 (visualization video)
-    - *_events.json (detected events)
+    Args:
+        video_dir: Directory with *_viz.mp4 files
+        events_dir: Directory with *_events.json files
+        output_dir: Output directory for visualization videos
     """
     # Find all viz videos
     viz_videos = glob.glob(os.path.join(video_dir, "*_viz.mp4"))
@@ -306,17 +252,22 @@ def batch_visualize(
     viz_videos = list(set(viz_videos))  # Remove duplicates
     
     print(f"Found {len(viz_videos)} visualization videos")
+    print(f"Events dir: {events_dir}")
+    print(f"Output dir: {output_dir}")
     
     os.makedirs(output_dir, exist_ok=True)
     
     for viz_path in viz_videos:
-        # Find corresponding events JSON
+        # Find corresponding events JSON in events_dir
         base_name = os.path.basename(viz_path)
         # Try different naming conventions
+        events_base = base_name.replace("_viz.mp4", "_events.json")
+        events_base = events_base.replace("_sam3rf_viz.mp4", "_events.json")
+        # Also try with _gaze suffix
         events_candidates = [
-            viz_path.replace("_viz.mp4", "_events.json"),
-            viz_path.replace("_sam3rf_viz.mp4", "_events.json"),
-            viz_path.replace("_viz.mp4", "_features.json").replace("_features", "_events"),
+            os.path.join(events_dir, events_base),
+            os.path.join(events_dir, events_base.replace("_events.json", "_gaze_events.json")),
+            os.path.join(events_dir, events_base.replace("_events.json", "_sam3rf_gaze_events.json")),
         ]
         
         events_path = None
@@ -342,11 +293,13 @@ def main():
     parser.add_argument("--viz_video", type=str, default=None, help="Single visualization video")
     parser.add_argument("--events_json", type=str, default=None, help="Events JSON for single video")
     parser.add_argument("--gestures_json", type=str, default=None, help="Gemini gestures JSON (optional)")
-    parser.add_argument("--output_video", type=str, default=None, help="Output path for single video")
-    parser.add_argument("--video_dir", type=str, default=None, help="Directory for batch processing")
-    parser.add_argument("--output_dir", type=str, default=None, help="Output directory for batch processing")
+    parser.add_argument("--video_dir", type=str, default=None, help="Directory with *_viz.mp4 for batch")
+    parser.add_argument("--events_dir", type=str, default=None, help="Directory with *_events.json for batch")
+    parser.add_argument("--output_dir", type=str, required=True, help="Output directory (required)")
     
     args = parser.parse_args()
+    
+    os.makedirs(args.output_dir, exist_ok=True)
     
     if args.viz_video:
         # Single video mode
@@ -362,19 +315,18 @@ def main():
             if os.path.exists(gestures_candidate):
                 args.gestures_json = gestures_candidate
         
-        if not args.output_video:
-            suffix = "_full_viz.mp4" if args.gestures_json else "_events_viz.mp4"
-            args.output_video = args.viz_video.replace("_viz.mp4", suffix)
-            args.output_video = args.output_video.replace("_sam3rf_viz.mp4", suffix)
+        # Generate output filename
+        base_name = os.path.basename(args.viz_video)
+        suffix = "_full_viz.mp4" if args.gestures_json else "_events_viz.mp4"
+        out_name = base_name.replace("_viz.mp4", suffix).replace("_sam3rf_viz.mp4", suffix)
+        output_path = os.path.join(args.output_dir, out_name)
         
-        visualize_events(args.viz_video, args.events_json, args.output_video, args.gestures_json)
+        visualize_events(args.viz_video, args.events_json, output_path, args.gestures_json)
     
     elif args.video_dir:
         # Batch mode
-        if not args.output_dir:
-            args.output_dir = os.path.join(args.video_dir, "events_viz")
-        
-        batch_visualize(args.video_dir, args.output_dir)
+        events_dir = args.events_dir or args.video_dir
+        batch_visualize(args.video_dir, events_dir, args.output_dir)
     
     else:
         parser.print_help()

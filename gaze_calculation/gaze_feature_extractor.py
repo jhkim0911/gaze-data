@@ -59,6 +59,7 @@ class FrameGazeFeatures:
     
     # NEW: Anchor-based features (physics-based)
     person_face_centers: Dict[int, Optional[Tuple[float, float]]]  # Anchor positions (face bbox center)
+    person_face_bboxes: Dict[int, Optional[List[float]]]  # Face bounding boxes [x1,y1,x2,y2] for mutual gaze
     person_gaze_directions: Dict[int, Optional[Tuple[float, float]]]  # Gaze direction relative to face
     person_face_velocities: Dict[int, Optional[float]]  # How fast face/person moved (for scene cut detection)
     person_is_scene_cut: Dict[int, bool]  # Did scene cut occur for this person?
@@ -114,6 +115,8 @@ def compute_convergence_score(gaze_points: List[Tuple[float, float]]) -> Tuple[f
     """
     Compute how clustered the gaze points are.
     
+    Uses MEDIAN distance (instead of mean) for robustness to outliers.
+    
     Returns:
         Tuple of (score, center) where:
         - score: 0.0 = maximally spread, 1.0 = all looking at same point
@@ -127,14 +130,14 @@ def compute_convergence_score(gaze_points: List[Tuple[float, float]]) -> Tuple[f
     cy = sum(p[1] for p in gaze_points) / len(gaze_points)
     center = (cx, cy)
     
-    # Compute mean distance from centroid
+    # Compute MEDIAN distance from centroid (robust to outliers)
     distances = [compute_gaze_distance(p, center) for p in gaze_points]
-    mean_dist = sum(distances) / len(distances)
+    median_dist = float(np.median(distances))
     
     # Convert to score (smaller distance = higher convergence)
     # Max possible distance in normalized space is sqrt(2) ≈ 1.414
-    # Use exponential decay: score = exp(-k * mean_dist)
-    score = math.exp(-3.0 * mean_dist)
+    # Use exponential decay: score = exp(-k * median_dist)
+    score = math.exp(-3.0 * median_dist)
     
     return score, center
 
@@ -216,7 +219,8 @@ def is_scene_cut(
 # Interpolation thresholds (tuned from data analysis)
 INTERPOLATE_MAX_GAP = 3      # Linear interpolation for gaps ≤ 3 frames
 CARRY_FORWARD_MAX_GAP = 10   # Carry forward for gaps 4-10 frames
-# Gaps > 10: Keep as null
+MAX_TIME_GAP_SEC = 3.0       # Never interpolate across gaps > 3 seconds (scene cuts) - 6 frames at 2fps
+# Gaps > 10 frames or > 3 seconds: Keep as null
 
 
 def interpolate_gaze_for_person(
@@ -272,7 +276,18 @@ def interpolate_gaze_for_person(
                 gap = next_valid - prev_valid - 1
                 position_in_gap = i - prev_valid
                 
-                if gap <= INTERPOLATE_MAX_GAP:
+                # Check timestamp gap - don't interpolate across scene cuts
+                time_gap = gaze_history[next_valid][0] - gaze_history[prev_valid][0]
+                if time_gap > MAX_TIME_GAP_SEC:
+                    # Scene cut detected - don't interpolate
+                    result.append({
+                        "timestamp": timestamp,
+                        "gaze_point": None,
+                        "gaze_confidence": 0.0,
+                        "gaze_method": "null_scene_cut",
+                        "original_inout": False,
+                    })
+                elif gap <= INTERPOLATE_MAX_GAP:
                     # Tier 1: Linear interpolation
                     t = position_in_gap / (gap + 1)
                     prev_gaze = gaze_history[prev_valid][1]
@@ -313,7 +328,18 @@ def interpolate_gaze_for_person(
             elif prev_valid is not None:
                 # Only have previous, carry forward if close enough
                 gap = i - prev_valid
-                if gap <= CARRY_FORWARD_MAX_GAP:
+                # Check timestamp gap for scene cuts
+                time_gap = gaze_history[i][0] - gaze_history[prev_valid][0]
+                if time_gap > MAX_TIME_GAP_SEC:
+                    # Scene cut - don't carry forward
+                    result.append({
+                        "timestamp": timestamp,
+                        "gaze_point": None,
+                        "gaze_confidence": 0.0,
+                        "gaze_method": "null_scene_cut",
+                        "original_inout": False,
+                    })
+                elif gap <= CARRY_FORWARD_MAX_GAP:
                     prev_gaze = gaze_history[prev_valid][1]
                     confidence = 0.5 * math.exp(-0.2 * gap)
                     result.append({
@@ -334,7 +360,18 @@ def interpolate_gaze_for_person(
             elif next_valid is not None:
                 # Only have next, carry backward if close enough
                 gap = next_valid - i
-                if gap <= CARRY_FORWARD_MAX_GAP:
+                # Check timestamp gap for scene cuts
+                time_gap = gaze_history[next_valid][0] - gaze_history[i][0]
+                if time_gap > MAX_TIME_GAP_SEC:
+                    # Scene cut - don't carry backward
+                    result.append({
+                        "timestamp": timestamp,
+                        "gaze_point": None,
+                        "gaze_confidence": 0.0,
+                        "gaze_method": "null_scene_cut",
+                        "original_inout": False,
+                    })
+                elif gap <= CARRY_FORWARD_MAX_GAP:
                     next_gaze = gaze_history[next_valid][1]
                     confidence = 0.5 * math.exp(-0.2 * gap)
                     result.append({
@@ -373,6 +410,7 @@ def compute_weighted_convergence_score(
     """
     Compute convergence score with confidence weighting.
     
+    Uses MEDIAN distance for robustness to outliers.
     Only considers gaze points with confidence >= min_confidence.
     Uses confidence as weight for centroid calculation.
     """
@@ -388,12 +426,13 @@ def compute_weighted_convergence_score(
     cy = sum(g[1] * c for g, c in valid) / total_weight
     center = (cx, cy)
     
-    # Weighted mean distance
-    weighted_dist = sum(compute_gaze_distance(g, center) * c for g, c in valid) / total_weight
+    # MEDIAN distance (robust to outliers)
+    distances = [compute_gaze_distance(g, center) for g, c in valid]
+    median_dist = float(np.median(distances))
     
     # Score with confidence penalty
     avg_confidence = total_weight / len(valid)
-    score = math.exp(-3.0 * weighted_dist) * avg_confidence
+    score = math.exp(-3.0 * median_dist) * avg_confidence
     
     return score, center
 
@@ -541,6 +580,7 @@ def extract_gaze_features(gaze_data: Dict) -> GazeFeaturesResult:
                 "frame_idx": frame_idx,
                 "timestamp": timestamp,
                 "face_center": face_center,
+                "face_bbox": person.get("face_bbox"),  # [x1, y1, x2, y2] for mutual gaze
                 "gaze_point": gaze_point,
                 "gaze_direction": gaze_direction,
             })
@@ -612,6 +652,7 @@ def extract_gaze_features(gaze_data: Dict) -> GazeFeaturesResult:
         
         # NEW: Anchor-based features
         person_face_centers = {}
+        person_face_bboxes = {}  # For mutual gaze bbox containment check
         person_gaze_directions = {}
         person_face_velocities = {}
         person_is_scene_cut = {}
@@ -620,17 +661,29 @@ def extract_gaze_features(gaze_data: Dict) -> GazeFeaturesResult:
         for person in persons:
             pid = person["person_id"]
             
-            # Get interpolated gaze data for this person at this frame index
-            interp_history = person_gaze_interpolated.get(pid, [])
-            if idx < len(interp_history):
-                interp_data = interp_history[idx]
-                person_gaze_points[pid] = interp_data["gaze_point"]
-                person_gaze_confidences[pid] = interp_data["gaze_confidence"]
-                person_gaze_methods[pid] = interp_data["gaze_method"]
+            # Get gaze data directly from current frame's person data
+            # (more reliable than interpolation history index which may mismatch)
+            if person.get("gaze_point") and person.get("inout") is True:
+                person_gaze_points[pid] = tuple(person["gaze_point"])
+                person_gaze_confidences[pid] = 1.0
+                person_gaze_methods[pid] = "measured"
             else:
-                person_gaze_points[pid] = None
-                person_gaze_confidences[pid] = 0.0
-                person_gaze_methods[pid] = "missing"
+                # Try to get from interpolation history for missing/OOF frames
+                # (Useful for static videos where gaze is temporarily lost)
+                interp_history = person_gaze_interpolated.get(pid, [])
+                # Look up by timestamp (more reliable than index)
+                found = False
+                for idata in interp_history:
+                    if abs(idata.get("timestamp", 0) - timestamp) < 0.01:
+                        person_gaze_points[pid] = idata["gaze_point"]
+                        person_gaze_confidences[pid] = idata["gaze_confidence"]
+                        person_gaze_methods[pid] = idata["gaze_method"]
+                        found = True
+                        break
+                if not found:
+                    person_gaze_points[pid] = None
+                    person_gaze_confidences[pid] = 0.0
+                    person_gaze_methods[pid] = "missing"
             
             # Get RAW velocity at this frame (original method)
             vel_history = person_velocities_over_time.get(pid, [])
@@ -643,17 +696,35 @@ def extract_gaze_features(gaze_data: Dict) -> GazeFeaturesResult:
             anchor_history = person_anchor_history.get(pid, [])
             anchor_velocities = person_anchor_velocities.get(pid, [])
             
-            if idx < len(anchor_history):
-                person_face_centers[pid] = anchor_history[idx]["face_center"]
-                person_gaze_directions[pid] = anchor_history[idx]["gaze_direction"]
+            # Get face_bbox directly from current frame's person data (not from anchor history)
+            # because anchor_history index doesn't match frame list index when persons enter/exit
+            person_face_bboxes[pid] = person.get("face_bbox") if person.get("face_detected") else None
+            
+            # For face Center and gaze direction, look up by frame_idx in anchor history
+            anchor_entry = None
+            for ah in anchor_history:
+                if ah.get("frame_idx") == frame_idx:
+                    anchor_entry = ah
+                    break
+            
+            if anchor_entry:
+                person_face_centers[pid] = anchor_entry["face_center"]
+                person_gaze_directions[pid] = anchor_entry["gaze_direction"]
             else:
                 person_face_centers[pid] = None
                 person_gaze_directions[pid] = None
             
-            if idx < len(anchor_velocities):
-                person_face_velocities[pid] = anchor_velocities[idx]["face_velocity"]
-                person_is_scene_cut[pid] = anchor_velocities[idx]["is_scene_cut"]
-                person_gaze_dir_velocities[pid] = anchor_velocities[idx]["gaze_dir_velocity"]
+            # For velocities, also look up by frame_idx
+            vel_entry = None
+            for av in anchor_velocities:
+                if av.get("frame_idx") == frame_idx:
+                    vel_entry = av
+                    break
+            
+            if vel_entry:
+                person_face_velocities[pid] = vel_entry["face_velocity"]
+                person_is_scene_cut[pid] = vel_entry["is_scene_cut"]
+                person_gaze_dir_velocities[pid] = vel_entry["gaze_dir_velocity"]
             else:
                 person_face_velocities[pid] = None
                 person_is_scene_cut[pid] = False
@@ -688,6 +759,7 @@ def extract_gaze_features(gaze_data: Dict) -> GazeFeaturesResult:
             person_gaze_methods=person_gaze_methods,
             # NEW fields:
             person_face_centers=person_face_centers,
+            person_face_bboxes=person_face_bboxes,  # For mutual gaze bbox check
             person_gaze_directions=person_gaze_directions,
             person_face_velocities=person_face_velocities,
             person_is_scene_cut=person_is_scene_cut,
@@ -779,29 +851,81 @@ def save_features(result: GazeFeaturesResult, output_path: str) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="Extract gaze features for social gesture detection")
-    parser.add_argument("--input_json", type=str, required=True, help="Path to gaze annotation JSON")
-    parser.add_argument("--output_json", type=str, default=None, help="Output path (default: input_features.json)")
+    parser.add_argument("--input_json", type=str, default=None, help="Path to single gaze annotation JSON")
+    parser.add_argument("--input_dir", type=str, default=None, help="Directory with *_gaze.json files for batch processing")
+    parser.add_argument("--output_json", type=str, default=None, help="Output path for single file mode")
+    parser.add_argument("--output_dir", type=str, default=None, help="Output directory for batch mode (default: same as input)")
     
     args = parser.parse_args()
     
-    if args.output_json is None:
-        base = os.path.splitext(args.input_json)[0]
-        args.output_json = f"{base}_features.json"
+    if args.input_dir:
+        # Batch processing mode
+        import glob
+        
+        output_dir = args.output_dir or args.input_dir
+        os.makedirs(output_dir, exist_ok=True)
+        
+        gaze_files = glob.glob(os.path.join(args.input_dir, "*.json"))
+        # Exclude output files (features, events, gestures, qa)
+        gaze_files = [f for f in gaze_files if not any(
+            f.endswith(suffix) for suffix in ["_features.json", "_events.json", "_gestures.json", "_qa_dataset.json"]
+        )]
+        gaze_files = sorted(set(gaze_files))
+        
+        print(f"Found {len(gaze_files)} gaze JSON files in: {args.input_dir}")
+        print(f"Output directory: {output_dir}")
+        
+        processed, skipped, errors = 0, 0, 0
+        
+        for i, gaze_path in enumerate(gaze_files):
+            base_name = os.path.basename(gaze_path)
+            out_name = base_name.replace(".json", "_features.json")
+            output_path = os.path.join(output_dir, out_name)
+            
+            # Skip if already processed
+            if os.path.exists(output_path):
+                print(f"[{i+1}/{len(gaze_files)}] {base_name} - SKIP (already exists)")
+                skipped += 1
+                continue
+            
+            print(f"[{i+1}/{len(gaze_files)}] {base_name}")
+            
+            try:
+                with open(gaze_path, 'r') as f:
+                    gaze_data = json.load(f)
+                
+                result = extract_gaze_features(gaze_data)
+                save_features(result, output_path)
+                processed += 1
+            except Exception as e:
+                print(f"  ERROR: {e}")
+                errors += 1
+        
+        print(f"\nDone! Processed: {processed}, Skipped: {skipped}, Errors: {errors}")
     
-    print(f"Loading gaze data from: {args.input_json}")
-    with open(args.input_json, 'r') as f:
-        gaze_data = json.load(f)
+    elif args.input_json:
+        # Single file mode
+        if args.output_json is None:
+            base = os.path.splitext(args.input_json)[0]
+            args.output_json = f"{base}_features.json"
+        
+        print(f"Loading gaze data from: {args.input_json}")
+        with open(args.input_json, 'r') as f:
+            gaze_data = json.load(f)
+        
+        print("Extracting gaze features...")
+        result = extract_gaze_features(gaze_data)
+        
+        print(f"  - {result.num_persons} persons")
+        print(f"  - {result.processed_frames} frames")
+        print(f"  - Mean convergence: {result.mean_convergence_score:.3f}")
+        print(f"  - High velocity events: {len(result.high_velocity_events)}")
+        print(f"  - High convergence events: {len(result.high_convergence_events)}")
+        
+        save_features(result, args.output_json)
     
-    print("Extracting gaze features...")
-    result = extract_gaze_features(gaze_data)
-    
-    print(f"  - {result.num_persons} persons")
-    print(f"  - {result.processed_frames} frames")
-    print(f"  - Mean convergence: {result.mean_convergence_score:.3f}")
-    print(f"  - High velocity events: {len(result.high_velocity_events)}")
-    print(f"  - High convergence events: {len(result.high_convergence_events)}")
-    
-    save_features(result, args.output_json)
+    else:
+        parser.print_help()
 
 
 if __name__ == "__main__":

@@ -40,11 +40,31 @@ class CandidateEvent:
     details: Dict
 
 
+def gaze_inside_bbox(gaze_point, bbox, margin=0.02):
+    """
+    Check if gaze point falls inside a bounding box with margin.
+    
+    Args:
+        gaze_point: (x, y) normalized gaze coordinates
+        bbox: [x1, y1, x2, y2] normalized bounding box
+        margin: Tolerance margin (default 2% of frame)
+        
+    Returns:
+        True if gaze is inside or very close to bbox
+    """
+    if gaze_point is None or bbox is None:
+        return False
+    x1, y1, x2, y2 = bbox
+    gx, gy = gaze_point
+    return (x1 - margin <= gx <= x2 + margin and 
+            y1 - margin <= gy <= y2 + margin)
+
+
 def detect_sudden_gaze_shifts(
     frame_features: List[Dict],
-    velocity_threshold: float = 0.5,
-    min_duration_sec: float = 0.3,
-    max_duration_sec: float = 1.0,
+    velocity_threshold: float = 0.7,
+    min_duration_sec: float = 0.5,  # At 2fps = 1 frame minimum
+    max_duration_sec: float = 1.5,  # At 2fps = 3 frames max
 ) -> List[CandidateEvent]:
     """
     Detect sudden gaze shift events where a person's gaze moves rapidly.
@@ -188,22 +208,32 @@ def detect_joint_attention(
             mean_conv = np.mean([f["convergence_score"] for f in cluster])
             max_conv = max(f["convergence_score"] for f in cluster)
             
-            # Find all persons involved
-            all_persons = set()
-            for f in cluster:
-                for pid, gaze in f.get("person_gaze_points", {}).items():
-                    if gaze is not None:
-                        all_persons.add(int(pid))
+            # Find the peak convergence frame (most representative)
+            peak_frame = max(cluster, key=lambda f: f["convergence_score"])
             
-            # Get average convergence center
-            centers = [f["center"] for f in cluster if f["center"]]
-            if centers:
-                avg_center = (
-                    np.mean([c[0] for c in centers]),
-                    np.mean([c[1] for c in centers])
-                )
-            else:
-                avg_center = None
+            # Get persons from peak frame only (not accumulated across all frames)
+            all_persons = set()
+            for pid, gaze in peak_frame.get("person_gaze_points", {}).items():
+                if gaze is not None:
+                    all_persons.add(int(pid))
+            
+            # Get convergence center from peak frame
+            avg_center = peak_frame.get("center")
+            
+            # Filter to only persons converging toward the center
+            if avg_center:
+                converging_persons = set()
+                DIST_THRESHOLD = 0.2  # 20% of frame
+                
+                for pid, gaze in peak_frame.get("person_gaze_points", {}).items():
+                    if gaze is not None:
+                        dist = np.sqrt((gaze[0] - avg_center[0])**2 + (gaze[1] - avg_center[1])**2)
+                        if dist < DIST_THRESHOLD:
+                            converging_persons.add(int(pid))
+                
+                # Only use converging persons if we have at least min_persons
+                if len(converging_persons) >= min_persons:
+                    all_persons = converging_persons
             
             events.append(CandidateEvent(
                 event_id=event_id,
@@ -267,6 +297,9 @@ def detect_gaze_following(
             history_a = person_gaze_history[pid_a]
             history_b = person_gaze_history[pid_b]
             
+            # Track detected events for this pair to avoid duplicates
+            pair_events = []  # [(start_time, end_time, confidence, details), ...]
+            
             # For each gaze point of A, check if B later looked at same place
             for t_a, frame_a, gaze_a in history_a:
                 for t_b, frame_b, gaze_b in history_b:
@@ -280,32 +313,67 @@ def detect_gaze_following(
                             
                             # Only keep high-confidence events
                             if confidence >= min_event_confidence:
-                                events.append(CandidateEvent(
-                                    event_id=event_id,
-                                    event_type="gaze_following",
-                                    start_time=t_a,
-                                    end_time=t_b,
-                                    start_frame=frame_a,
-                                    end_frame=frame_b,
-                                    confidence=confidence,
-                                    persons_involved=[pid_a, pid_b],
-                                    details={
-                                        "leader_id": pid_a,
-                                        "follower_id": pid_b,
-                                        "lag_seconds": lag,
-                                        "gaze_distance": dist,
-                                        "gaze_target": list(gaze_a),
-                                    }
-                                ))
-                                event_id += 1
+                                pair_events.append({
+                                    "start_time": t_a,
+                                    "end_time": t_b,
+                                    "start_frame": frame_a,
+                                    "end_frame": frame_b,
+                                    "confidence": confidence,
+                                    "lag_seconds": lag,
+                                    "gaze_distance": dist,
+                                    "gaze_target": list(gaze_a),
+                                })
+            
+            # Merge overlapping events for this pair
+            if not pair_events:
+                continue
+                
+            pair_events.sort(key=lambda x: x["start_time"])
+            merged = [pair_events[0]]
+            
+            for e in pair_events[1:]:
+                last = merged[-1]
+                # If overlapping (new start <= last end + 1 sec), merge them
+                if e["start_time"] <= last["end_time"] + 1.0:
+                    # Extend end time, keep best confidence
+                    last["end_time"] = max(last["end_time"], e["end_time"])
+                    last["end_frame"] = max(last["end_frame"], e["end_frame"])
+                    if e["confidence"] > last["confidence"]:
+                        last["confidence"] = e["confidence"]
+                        last["lag_seconds"] = e["lag_seconds"]
+                        last["gaze_distance"] = e["gaze_distance"]
+                        last["gaze_target"] = e["gaze_target"]
+                else:
+                    merged.append(e)
+            
+            # Create events from merged list
+            for e in merged:
+                events.append(CandidateEvent(
+                    event_id=event_id,
+                    event_type="gaze_following",
+                    start_time=e["start_time"],
+                    end_time=e["end_time"],
+                    start_frame=e["start_frame"],
+                    end_frame=e["end_frame"],
+                    confidence=e["confidence"],
+                    persons_involved=[pid_a, pid_b],
+                    details={
+                        "leader_id": pid_a,
+                        "follower_id": pid_b,
+                        "lag_seconds": e["lag_seconds"],
+                        "gaze_distance": e["gaze_distance"],
+                        "gaze_target": e["gaze_target"],
+                    }
+                ))
+                event_id += 1
     
     return events
 
 
 def detect_attention_capture(
     frame_features: List[Dict],
-    velocity_threshold: float = 0.4,
-    min_persons: int = 2,
+    velocity_threshold: float = 0.4,  # Lowered from 0.6 to detect more events
+    min_persons: int = 3,  # Keep at 3 to reduce noise
     time_window_sec: float = 0.5,
 ) -> List[CandidateEvent]:
     """
@@ -392,8 +460,8 @@ def detect_attention_capture(
 
 def detect_mutual_gaze(
     frame_features: List[Dict],
-    distance_threshold: float = 0.15,  # How close gaze must be to other person's face
-    min_duration_sec: float = 0.5,
+    distance_threshold: float = 0.15,  # Legacy param, not used with bbox method
+    min_duration_sec: float = 1.0,  # At 2fps = 2 frames minimum
     min_confidence: float = 0.5,
 ) -> List[CandidateEvent]:
     """
@@ -416,45 +484,51 @@ def detect_mutual_gaze(
     mutual_gaze_frames: Dict[str, List[Dict]] = {}  # "pidA_pidB" -> list of frames
     
     for ff in frame_features:
-        face_centers = ff.get("person_face_centers", {})
+        face_bboxes = ff.get("person_face_bboxes", {})
         gaze_points = ff.get("person_gaze_points", {})
         gaze_confidences = ff.get("person_gaze_confidences", {})
+        gaze_methods = ff.get("person_gaze_methods", {})
         
-        # Get all person IDs with valid face_center and gaze_point
+        # Get all person IDs with valid face_bbox and MEASURED gaze_point
+        # (Don't use interpolated gaze for mutual gaze detection)
         valid_persons = []
-        for pid_str in face_centers.keys():
+        for pid_str in face_bboxes.keys():
             pid = int(pid_str)
-            face_center = face_centers.get(str(pid)) or face_centers.get(pid)
+            face_bbox = face_bboxes.get(str(pid)) or face_bboxes.get(pid)
             gaze_point = gaze_points.get(str(pid)) or gaze_points.get(pid)
             gaze_conf = gaze_confidences.get(str(pid), gaze_confidences.get(pid, 0))
+            gaze_method = gaze_methods.get(str(pid), gaze_methods.get(pid, ""))
             
-            if face_center and gaze_point and gaze_conf >= min_confidence:
+            # Only use MEASURED gaze for mutual gaze (not interpolated)
+            if face_bbox and gaze_point and gaze_conf >= min_confidence and gaze_method == "measured":
                 valid_persons.append({
                     "pid": pid,
-                    "face_center": face_center,
+                    "face_bbox": face_bbox,  # [x1, y1, x2, y2]
                     "gaze_point": gaze_point,
                 })
         
-        # Check all pairs for mutual gaze
+        # Check all pairs for mutual gaze using bbox containment
         for i, person_a in enumerate(valid_persons):
             for person_b in valid_persons[i+1:]:
                 pid_a = person_a["pid"]
                 pid_b = person_b["pid"]
                 
-                # Check if A looks at B's face
-                dist_a_to_b = np.sqrt(
-                    (person_a["gaze_point"][0] - person_b["face_center"][0])**2 +
-                    (person_a["gaze_point"][1] - person_b["face_center"][1])**2
+                # Check if A's gaze is inside B's face bbox (with small margin)
+                a_looks_at_b = gaze_inside_bbox(
+                    person_a["gaze_point"], 
+                    person_b["face_bbox"],
+                    margin=0.02  # 2% margin for tolerance
                 )
                 
-                # Check if B looks at A's face
-                dist_b_to_a = np.sqrt(
-                    (person_b["gaze_point"][0] - person_a["face_center"][0])**2 +
-                    (person_b["gaze_point"][1] - person_a["face_center"][1])**2
+                # Check if B's gaze is inside A's face bbox
+                b_looks_at_a = gaze_inside_bbox(
+                    person_b["gaze_point"],
+                    person_a["face_bbox"],
+                    margin=0.02
                 )
                 
-                # Both must be looking at each other
-                if dist_a_to_b < distance_threshold and dist_b_to_a < distance_threshold:
+                # Both must be looking at each other's face
+                if a_looks_at_b and b_looks_at_a:
                     pair_key = f"{min(pid_a, pid_b)}_{max(pid_a, pid_b)}"
                     if pair_key not in mutual_gaze_frames:
                         mutual_gaze_frames[pair_key] = []
@@ -462,8 +536,6 @@ def detect_mutual_gaze(
                     mutual_gaze_frames[pair_key].append({
                         "frame_idx": ff["frame_idx"],
                         "timestamp": ff["timestamp"],
-                        "dist_a_to_b": dist_a_to_b,
-                        "dist_b_to_a": dist_b_to_a,
                         "persons": [pid_a, pid_b],
                     })
     
@@ -478,7 +550,8 @@ def detect_mutual_gaze(
         current_cluster = [frames[0]]
         
         for i in range(1, len(frames)):
-            if frames[i]["timestamp"] - frames[i-1]["timestamp"] < 0.6:
+            # Gap threshold: 1.5s for 2fps video (0.5s/frame + margin for dropped frames)
+            if frames[i]["timestamp"] - frames[i-1]["timestamp"] < 1.5:
                 current_cluster.append(frames[i])
             else:
                 if current_cluster:
@@ -493,11 +566,9 @@ def detect_mutual_gaze(
             duration = cluster[-1]["timestamp"] - cluster[0]["timestamp"]
             
             if duration >= min_duration_sec:
-                mean_dist = np.mean([
-                    (f["dist_a_to_b"] + f["dist_b_to_a"]) / 2 
-                    for f in cluster
-                ])
-                confidence = max(0, 1.0 - (mean_dist / distance_threshold))
+                # Confidence based on number of frames (bbox containment is binary)
+                num_frames = len(cluster)
+                confidence = min(1.0, 0.5 + 0.1 * num_frames)
                 
                 events.append(CandidateEvent(
                     event_id=event_id,
@@ -510,8 +581,7 @@ def detect_mutual_gaze(
                     persons_involved=cluster[0]["persons"],
                     details={
                         "duration": duration,
-                        "mean_gaze_distance": mean_dist,
-                        "num_frames": len(cluster),
+                        "num_frames": num_frames,
                     }
                 ))
                 event_id += 1
@@ -585,32 +655,83 @@ def save_events(events: List[CandidateEvent], features_data: Dict, output_path: 
 
 def main():
     parser = argparse.ArgumentParser(description="Detect candidate social gesture events")
-    parser.add_argument("--input_features", type=str, required=True, help="Path to gaze features JSON")
-    parser.add_argument("--output_json", type=str, default=None, help="Output path (default: input_events.json)")
+    parser.add_argument("--input_features", type=str, default=None, help="Path to single gaze features JSON")
+    parser.add_argument("--input_dir", type=str, default=None, help="Directory with *_features.json files for batch processing")
+    parser.add_argument("--output_json", type=str, default=None, help="Output path for single file mode")
+    parser.add_argument("--output_dir", type=str, default=None, help="Output directory for batch mode (default: same as input)")
     
     args = parser.parse_args()
     
-    if args.output_json is None:
-        base = os.path.splitext(args.input_features)[0].replace("_features", "")
-        args.output_json = f"{base}_events.json"
+    if args.input_dir:
+        # Batch processing mode
+        import glob
+        
+        output_dir = args.output_dir or args.input_dir
+        os.makedirs(output_dir, exist_ok=True)
+        
+        feature_files = glob.glob(os.path.join(args.input_dir, "*_features.json"))
+        feature_files = sorted(set(feature_files))
+        
+        print(f"Found {len(feature_files)} features JSON files in: {args.input_dir}")
+        print(f"Output directory: {output_dir}")
+        
+        processed, skipped, errors = 0, 0, 0
+        total_events = 0
+        
+        for i, features_path in enumerate(feature_files):
+            base_name = os.path.basename(features_path)
+            out_name = base_name.replace("_features.json", "_events.json")
+            output_path = os.path.join(output_dir, out_name)
+            
+            # Skip if already processed
+            if os.path.exists(output_path):
+                print(f"[{i+1}/{len(feature_files)}] {base_name} - SKIP (already exists)")
+                skipped += 1
+                continue
+            
+            print(f"[{i+1}/{len(feature_files)}] {base_name}")
+            
+            try:
+                with open(features_path, 'r') as f:
+                    features_data = json.load(f)
+                
+                events = detect_all_events(features_data)
+                save_events(events, features_data, output_path)
+                total_events += len(events)
+                processed += 1
+            except Exception as e:
+                print(f"  ERROR: {e}")
+                errors += 1
+        
+        print(f"\nDone! Processed: {processed}, Skipped: {skipped}, Errors: {errors}")
+        print(f"Total events detected: {total_events}")
     
-    print(f"Loading gaze features from: {args.input_features}")
-    with open(args.input_features, 'r') as f:
-        features_data = json.load(f)
+    elif args.input_features:
+        # Single file mode
+        if args.output_json is None:
+            base = os.path.splitext(args.input_features)[0].replace("_features", "")
+            args.output_json = f"{base}_events.json"
+        
+        print(f"Loading gaze features from: {args.input_features}")
+        with open(args.input_features, 'r') as f:
+            features_data = json.load(f)
+        
+        print("Detecting candidate events...")
+        events = detect_all_events(features_data)
+        
+        # Print summary
+        print(f"\nDetected {len(events)} candidate events:")
+        event_types = {}
+        for e in events:
+            event_types[e.event_type] = event_types.get(e.event_type, 0) + 1
+        
+        for t, count in sorted(event_types.items()):
+            print(f"  - {t}: {count}")
+        
+        save_events(events, features_data, args.output_json)
     
-    print("Detecting candidate events...")
-    events = detect_all_events(features_data)
-    
-    # Print summary
-    print(f"\nDetected {len(events)} candidate events:")
-    event_types = {}
-    for e in events:
-        event_types[e.event_type] = event_types.get(e.event_type, 0) + 1
-    
-    for t, count in sorted(event_types.items()):
-        print(f"  - {t}: {count}")
-    
-    save_events(events, features_data, args.output_json)
+    else:
+        parser.print_help()
 
 
 if __name__ == "__main__":

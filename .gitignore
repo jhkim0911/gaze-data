@@ -3,3 +3,4 @@ scripts/
 data_results/
 __pycache__/
 *.pyc
+.env
