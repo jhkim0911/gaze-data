@@ -63,14 +63,8 @@ class GestureClassification:
     # Binary validation of detected gaze event
     event_confirmed: bool
     rejection_reason: Optional[str]  # Only if rejected
-    # Deictic gesture detection
-    deictic_gesture_detected: bool
-    deictic_gesture_type: Optional[str]  # "pointing", "showing", "giving", "reaching"
-    initiator_id: Optional[int]
-    # Gesture target (for QA: B2 task)
-    gesture_target_type: Optional[str]  # "person", "object", "location"
-    gesture_target_person_id: Optional[int]
-    gesture_target_description: Optional[str]
+    # Deictic gestures (supports multiple concurrent gestures)
+    deictic_gestures: List[Dict]  # List of {gesture_type, initiator_id, target_type, target_person_id, target_description}
     # Causality (for QA: C2 task)
     caused_gaze_shift: bool
     responder_ids: List[int]
@@ -220,47 +214,42 @@ def build_classification_prompt(event: Dict, gaze_context: Dict) -> str:
     prompt = f"""Analyze these video frames to validate a detected social interaction event.
 
 ## About These Frames
-These frames have annotations drawn on them:
-- Colored bounding boxes with person labels (P0, P1, P2, etc.)
-- Lines showing where each person is looking (gaze direction)
+- These frames have annotations: Colored bounding boxes (P0, P1, P2...) and gaze direction lines.
+- **Note on Gaze Accuracy**: Gaze lines are approximate. Do not be overly strict about the exact endpoint of the line. Prioritize the logical context and the general trajectory of the gaze to determine the target.
 
-## Event Detected by Gaze Analysis
+## Event Detected
 - Type: **{event_type}** = {event_desc}
 - Time: {event.get('start_time', 0):.2f}s - {event.get('end_time', 0):.2f}s
-- Persons involved: {persons}
+- Persons: {persons}
 
-## Your Tasks
-1. **Validate**: Look at the gaze lines - do they support this {event_type} event?
-2. **Detect Deictic Gestures**: Did anyone point, show, give, or reach for something?
-3. **Identify Targets**: If gesture detected, what/who is the target?
-4. **Identify Causality**: Did any gesture cause others to shift their gaze?
+## Tasks
+1. **Validate**: Do gaze patterns support this {event_type}?
+2. **Detect Gestures**: List ALL deictic gestures (pointing, showing, giving, reaching)
+3. **Causality**: Did any gesture cause gaze shifts?
 
-## Deictic Gestures:
-- **pointing**: Someone pointing at something
-- **showing**: Someone displaying an object
-- **giving**: Someone handing over an object
-- **reaching**: Someone reaching toward an object
+## Response Format (JSON only)
 
-## Response Format (JSON only):
 {{
     "event_confirmed": true | false,
     "rejection_reason": "<only if rejected>",
     
-    "deictic_gesture_detected": true | false,
-    "deictic_gesture_type": "pointing" | "showing" | "giving" | "reaching" | null,
-    "initiator_id": <person ID who did the gesture, or null>,
-    
-    "gesture_target_type": "person" | "object" | null,
-    "gesture_target_person_id": <person ID if target is a person, else null>,
-    "gesture_target_description": "<what they're pointing at/showing, or null>",
+    "deictic_gestures": [
+        {{
+            "gesture_type": "pointing" | "showing" | "giving" | "reaching",
+            "initiator_id": <person ID>,
+            "target_type": "person" | "object" | "location",
+            "target_person_id": <ID if person, else null>,
+            "target_description": "<what/who>"
+        }}
+    ],
     
     "caused_gaze_shift": true | false,
-    "responder_ids": [<person IDs who shifted gaze in response>],
+    "responder_ids": [<person IDs who shifted gaze>],
     
     "description": "<what's happening>"
 }}
 
-Respond with ONLY the JSON object.
+Return empty array for deictic_gestures if none detected. Respond with ONLY a valid JSON object. No reasoning or introductory text.
 """
     return prompt
 
@@ -398,12 +387,7 @@ def classify_events(
                 event_id=event.get("event_id", i),
                 event_confirmed=parsed.get("event_confirmed", False),
                 rejection_reason=parsed.get("rejection_reason"),
-                deictic_gesture_detected=parsed.get("deictic_gesture_detected", False),
-                deictic_gesture_type=parsed.get("deictic_gesture_type"),
-                initiator_id=parsed.get("initiator_id"),
-                gesture_target_type=parsed.get("gesture_target_type"),
-                gesture_target_person_id=parsed.get("gesture_target_person_id"),
-                gesture_target_description=parsed.get("gesture_target_description"),
+                deictic_gestures=parsed.get("deictic_gestures", []),
                 caused_gaze_shift=parsed.get("caused_gaze_shift", False),
                 responder_ids=parsed.get("responder_ids", []),
                 description=parsed.get("description", ""),
@@ -414,12 +398,7 @@ def classify_events(
                 event_id=event.get("event_id", i),
                 event_confirmed=False,
                 rejection_reason="Failed to parse Gemini response",
-                deictic_gesture_detected=False,
-                deictic_gesture_type=None,
-                initiator_id=None,
-                gesture_target_type=None,
-                gesture_target_person_id=None,
-                gesture_target_description=None,
+                deictic_gestures=[],
                 caused_gaze_shift=False,
                 responder_ids=[],
                 description="",
@@ -443,8 +422,10 @@ def save_classifications(
     deictic_counts = {}
     
     for r in results:
-        if r.deictic_gesture_detected and r.deictic_gesture_type:
-            deictic_counts[r.deictic_gesture_type] = deictic_counts.get(r.deictic_gesture_type, 0) + 1
+        for gesture in r.deictic_gestures:
+            g_type = gesture.get("gesture_type")
+            if g_type:
+                deictic_counts[g_type] = deictic_counts.get(g_type, 0) + 1
     
     output = {
         "video_path": events_data.get("video_path"),
@@ -461,12 +442,7 @@ def save_classifications(
             "event_id": r.event_id,
             "event_confirmed": r.event_confirmed,
             "rejection_reason": r.rejection_reason,
-            "deictic_gesture_detected": r.deictic_gesture_detected,
-            "deictic_gesture_type": r.deictic_gesture_type,
-            "initiator_id": r.initiator_id,
-            "gesture_target_type": r.gesture_target_type,
-            "gesture_target_person_id": r.gesture_target_person_id,
-            "gesture_target_description": r.gesture_target_description,
+            "deictic_gestures": r.deictic_gestures,
             "caused_gaze_shift": r.caused_gaze_shift,
             "responder_ids": r.responder_ids,
             "description": r.description,
@@ -479,61 +455,75 @@ def save_classifications(
     print(f"Saved {len(results)} classifications to: {output_path}")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Classify social gestures using Gemini")
-    parser.add_argument("--video_path", type=str, required=True, help="Path to video")
-    parser.add_argument("--events_json", type=str, required=True, help="Path to candidate events JSON")
-    parser.add_argument("--gaze_json", type=str, default=None, help="Path to gaze annotation JSON (optional)")
-    parser.add_argument("--output_json", type=str, default=None, help="Output path")
-    parser.add_argument("--api_key", type=str, default=None, help="Gemini API key (or set GOOGLE_API_KEY env)")
-    parser.add_argument("--model", type=str, default="gemini-2.0-flash", help="Gemini model to use")
-    parser.add_argument("--max_events", type=int, default=None, help="Max events to classify")
+def get_output_filename(events_json_path: str) -> str:
+    """Generate output filename from events JSON path.
     
-    args = parser.parse_args()
+    Pattern: {video_id}_sam3rf_gaze_events.json -> {video_id}_gestures.json
+    """
+    basename = os.path.basename(events_json_path)
+    # Remove _sam3rf_gaze_events.json suffix
+    video_id = basename.replace("_sam3rf_gaze_events.json", "").replace("_gaze_events.json", "").replace("_events.json", "")
+    return f"{video_id}_gestures.json"
+
+
+def process_single_video(
+    video_path: str,
+    events_json: str,
+    output_path: str,
+    api_key: str,
+    model_name: str = "gemini-2.0-flash",
+    gaze_json: Optional[str] = None,
+    max_events: Optional[int] = None,
+) -> bool:
+    """Process a single video and save classifications.
     
-    if args.output_json is None:
-        base = os.path.splitext(args.events_json)[0].replace("_events", "")
-        args.output_json = f"{base}_gestures.json"
+    Returns True if successful, False otherwise.
+    """
+    print(f"\n{'='*60}")
+    print(f"Processing: {os.path.basename(events_json)}")
+    print(f"{'='*60}")
     
-    # Get API key
-    api_key = args.api_key or os.environ.get("GOOGLE_API_KEY")
-    if not api_key:
-        print("ERROR: No API key provided. Set GOOGLE_API_KEY env or use --api_key")
-        return
-    
-    print(f"Loading events from: {args.events_json}")
-    with open(args.events_json, 'r') as f:
+    # Load events
+    print(f"Loading events from: {events_json}")
+    with open(events_json, 'r') as f:
         events_data = json.load(f)
     
+    # Load gaze data if provided
     gaze_data = {}
-    if args.gaze_json:
-        print(f"Loading gaze data from: {args.gaze_json}")
-        with open(args.gaze_json, 'r') as f:
+    if gaze_json and os.path.exists(gaze_json):
+        print(f"Loading gaze data from: {gaze_json}")
+        with open(gaze_json, 'r') as f:
             gaze_data = json.load(f)
     
     events = events_data.get("events", [])
     print(f"Found {len(events)} candidate events")
     
+    if not events:
+        print("No events to process, skipping...")
+        return True
+    
+    # Classify events
     print("Classifying with Gemini...")
     results = classify_events(
-        args.video_path,
+        video_path,
         events,
         gaze_data,
         api_key=api_key,
-        model_name=args.model,
-        max_events=args.max_events,
+        model_name=model_name,
+        max_events=max_events,
     )
     
     # Print summary
     print(f"\nClassification Summary:")
-    
     confirmed_count = sum(1 for r in results if r.event_confirmed)
     rejected_count = len(results) - confirmed_count
     deictic_counts = {}
     
     for r in results:
-        if r.deictic_gesture_detected and r.deictic_gesture_type:
-            deictic_counts[r.deictic_gesture_type] = deictic_counts.get(r.deictic_gesture_type, 0) + 1
+        for gesture in r.deictic_gestures:
+            g_type = gesture.get("gesture_type")
+            if g_type:
+                deictic_counts[g_type] = deictic_counts.get(g_type, 0) + 1
     
     print(f"  Events confirmed: {confirmed_count}")
     print(f"  Events rejected: {rejected_count}")
@@ -543,7 +533,191 @@ def main():
         for gesture, count in deictic_counts.items():
             print(f"    - {gesture}: {count}")
     
-    save_classifications(results, events_data, args.output_json)
+    # Save results
+    save_classifications(results, events_data, output_path)
+    return True
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Classify social gestures using Gemini",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Single file mode
+  python gemini_gesture_classifier.py \\
+      --video_path /path/to/video.mp4 \\
+      --events_json /path/to/events.json
+
+  # Single file with output directory
+  python gemini_gesture_classifier.py \\
+      --video_path /path/to/video.mp4 \\
+      --events_json /path/to/events.json \\
+      --output_dir /path/to/output
+
+  # Batch mode
+  python gemini_gesture_classifier.py \\
+      --batch \\
+      --events_dir /path/to/event_data \\
+      --videos_dir /path/to/gaze_videos \\
+      --output_dir /path/to/gesture_output
+        """
+    )
+    
+    # Mode selection
+    parser.add_argument("--batch", action="store_true", help="Enable batch processing mode")
+    
+    # Single file mode args
+    parser.add_argument("--video_path", type=str, help="Path to video (single mode)")
+    parser.add_argument("--events_json", type=str, help="Path to candidate events JSON (single mode)")
+    parser.add_argument("--gaze_json", type=str, default=None, help="Path to gaze annotation JSON (optional)")
+    parser.add_argument("--output_json", type=str, default=None, help="Output path (single mode, overrides output_dir)")
+    
+    # Batch mode args
+    parser.add_argument("--events_dir", type=str, help="Directory containing event JSON files (batch mode)")
+    parser.add_argument("--videos_dir", type=str, help="Directory containing visualization videos (batch mode)")
+    
+    # Common args
+    parser.add_argument("--output_dir", type=str, default=None, help="Output directory for gesture JSONs")
+    parser.add_argument("--api_key", type=str, default=None, help="Gemini API key (or set GOOGLE_API_KEY env)")
+    parser.add_argument("--model", type=str, default="gemini-2.0-flash", help="Gemini model to use")
+    parser.add_argument("--max_events", type=int, default=None, help="Max events to classify per video")
+    parser.add_argument("--skip_existing", action="store_true", help="Skip if output file already exists")
+    
+    args = parser.parse_args()
+    
+    # Get API key
+    api_key = args.api_key or os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        print("ERROR: No API key provided. Set GOOGLE_API_KEY env or use --api_key")
+        return
+    
+    if args.batch:
+        # ========== BATCH MODE ==========
+        if not args.events_dir or not args.videos_dir:
+            print("ERROR: Batch mode requires --events_dir and --videos_dir")
+            return
+        
+        if not args.output_dir:
+            print("ERROR: Batch mode requires --output_dir")
+            return
+        
+        os.makedirs(args.output_dir, exist_ok=True)
+        
+        # Find all event files
+        event_files = sorted([
+            f for f in os.listdir(args.events_dir) 
+            if f.endswith("_events.json")
+        ])
+        
+        print(f"Found {len(event_files)} event files in {args.events_dir}")
+        
+        processed = 0
+        skipped = 0
+        failed = 0
+        
+        for event_file in event_files:
+            events_json = os.path.join(args.events_dir, event_file)
+            output_filename = get_output_filename(events_json)
+            output_path = os.path.join(args.output_dir, output_filename)
+            
+            # Skip if exists
+            if args.skip_existing and os.path.exists(output_path):
+                print(f"Skipping (exists): {output_filename}")
+                skipped += 1
+                continue
+            
+            # Find matching video
+            # Pattern: {video_id}_sam3rf_gaze_events.json -> {video_id}_sam3rf_viz.mp4
+            video_id = event_file.replace("_sam3rf_gaze_events.json", "").replace("_gaze_events.json", "").replace("_events.json", "")
+            
+            # Try different video naming patterns
+            video_candidates = [
+                os.path.join(args.videos_dir, f"{video_id}_sam3rf_viz.mp4"),
+                os.path.join(args.videos_dir, f"{video_id}_viz.mp4"),
+                os.path.join(args.videos_dir, f"{video_id}.mp4"),
+            ]
+            
+            video_path = None
+            for candidate in video_candidates:
+                if os.path.exists(candidate):
+                    video_path = candidate
+                    break
+            
+            if not video_path:
+                print(f"WARNING: No video found for {event_file}, skipping...")
+                failed += 1
+                continue
+            
+            # Find matching gaze JSON (optional)
+            gaze_json = None
+            gaze_candidates = [
+                os.path.join(args.videos_dir, f"{video_id}_sam3rf_gaze.json"),
+                os.path.join(args.videos_dir, f"{video_id}_gaze.json"),
+            ]
+            for candidate in gaze_candidates:
+                if os.path.exists(candidate):
+                    gaze_json = candidate
+                    break
+            
+            try:
+                success = process_single_video(
+                    video_path=video_path,
+                    events_json=events_json,
+                    output_path=output_path,
+                    api_key=api_key,
+                    model_name=args.model,
+                    gaze_json=gaze_json,
+                    max_events=args.max_events,
+                )
+                if success:
+                    processed += 1
+                else:
+                    failed += 1
+            except Exception as e:
+                print(f"ERROR processing {event_file}: {e}")
+                failed += 1
+        
+        print(f"\n{'='*60}")
+        print(f"Batch Processing Complete")
+        print(f"{'='*60}")
+        print(f"  Processed: {processed}")
+        print(f"  Skipped:   {skipped}")
+        print(f"  Failed:    {failed}")
+        print(f"  Total:     {len(event_files)}")
+    
+    else:
+        # ========== SINGLE FILE MODE ==========
+        if not args.video_path or not args.events_json:
+            print("ERROR: Single mode requires --video_path and --events_json")
+            return
+        
+        # Determine output path
+        if args.output_json:
+            output_path = args.output_json
+        elif args.output_dir:
+            os.makedirs(args.output_dir, exist_ok=True)
+            output_filename = get_output_filename(args.events_json)
+            output_path = os.path.join(args.output_dir, output_filename)
+        else:
+            # Default: same directory as events_json
+            base = os.path.splitext(args.events_json)[0].replace("_events", "")
+            output_path = f"{base}_gestures.json"
+        
+        # Skip if exists
+        if args.skip_existing and os.path.exists(output_path):
+            print(f"Skipping (exists): {output_path}")
+            return
+        
+        process_single_video(
+            video_path=args.video_path,
+            events_json=args.events_json,
+            output_path=output_path,
+            api_key=api_key,
+            model_name=args.model,
+            gaze_json=args.gaze_json,
+            max_events=args.max_events,
+        )
 
 
 if __name__ == "__main__":
