@@ -197,13 +197,29 @@ def detect_joint_attention(
         return events
     
     # Cluster consecutive high-convergence frames
+    # Break cluster on: time gap OR significant change in present persons
     high_conv_frames = sorted(high_conv_frames, key=lambda x: x["timestamp"])
+    
+    def persons_overlap_enough(set1, set2, min_overlap=0.7):
+        """Check if two person sets overlap by at least min_overlap ratio."""
+        if not set1 or not set2:
+            return False
+        intersection = set1 & set2
+        # At least 70% of the smaller set should overlap
+        smaller_size = min(len(set1), len(set2))
+        return len(intersection) >= smaller_size * min_overlap
     
     clusters = []
     current_cluster = [high_conv_frames[0]]
     
     for i in range(1, len(high_conv_frames)):
-        if high_conv_frames[i]["timestamp"] - high_conv_frames[i-1]["timestamp"] < 0.6:
+        time_gap_ok = high_conv_frames[i]["timestamp"] - high_conv_frames[i-1]["timestamp"] < 0.6
+        # Check if present persons are similar to previous frame
+        prev_persons = high_conv_frames[i-1].get("present_persons", set())
+        curr_persons = high_conv_frames[i].get("present_persons", set())
+        persons_similar = persons_overlap_enough(prev_persons, curr_persons)
+        
+        if time_gap_ok and persons_similar:
             current_cluster.append(high_conv_frames[i])
         else:
             if current_cluster:
@@ -212,6 +228,7 @@ def detect_joint_attention(
     
     if current_cluster:
         clusters.append(current_cluster)
+
     
     # Create events from clusters
     for cluster in clusters:
@@ -431,14 +448,27 @@ def detect_attention_capture(
         return events
 
     
-    # Cluster by time
+    # Cluster by time AND person overlap
     multi_shift_frames = sorted(multi_shift_frames, key=lambda x: x["timestamp"])
+    
+    def persons_overlap_enough(set1, set2, min_overlap=0.7):
+        """Check if two person sets overlap by at least min_overlap ratio."""
+        if not set1 or not set2:
+            return False
+        intersection = set1 & set2
+        smaller_size = min(len(set1), len(set2))
+        return len(intersection) >= smaller_size * min_overlap
     
     clusters = []
     current_cluster = [multi_shift_frames[0]]
     
     for i in range(1, len(multi_shift_frames)):
-        if multi_shift_frames[i]["timestamp"] - multi_shift_frames[i-1]["timestamp"] < time_window_sec:
+        time_gap_ok = multi_shift_frames[i]["timestamp"] - multi_shift_frames[i-1]["timestamp"] < time_window_sec
+        prev_persons = multi_shift_frames[i-1].get("present_persons", set())
+        curr_persons = multi_shift_frames[i].get("present_persons", set())
+        persons_similar = persons_overlap_enough(prev_persons, curr_persons)
+        
+        if time_gap_ok and persons_similar:
             current_cluster.append(multi_shift_frames[i])
         else:
             if current_cluster:
