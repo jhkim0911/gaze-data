@@ -22,25 +22,38 @@ import argparse
 import base64
 import json
 import os
+import sys
 import tempfile
+
+# Force unbuffered output for SLURM/logging
+sys.stdout.reconfigure(line_buffering=True)
+
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-# Load .env file if present
+# Load .env file from project root
+ENV_FILE_PATH = "/u/arkimjh/code/ECCV-jh/.env"
+
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    import os as _os
+    if _os.path.exists(ENV_FILE_PATH):
+        load_dotenv(ENV_FILE_PATH)
+    else:
+        load_dotenv()  # Fallback to default .env search
 except ImportError:
     pass  # dotenv not installed, use env vars directly
 
 try:
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types
     GEMINI_AVAILABLE = True
 except ImportError:
     GEMINI_AVAILABLE = False
-    print("Warning: google-generativeai not installed. Install: pip install google-generativeai")
+    print("Warning: google-genai not installed. Install: pip install google-genai")
+
 
 
 # Deictic gesture taxonomy (these require visual analysis - can't be detected from gaze alone)
@@ -51,157 +64,114 @@ DEICTIC_GESTURES = {
     "reaching": "Extending arm to acquire or touch an object",
 }
 
-# Note: Social attention patterns (joint_attention, gaze_following, turn_taking, attention_capture)
-# are detected by gaze_feature_extractor.py and candidate_event_detector.py
-# Gemini's role is to VALIDATE those detections and identify accompanying deictic gestures
-
 
 @dataclass
 class GestureClassification:
     """Classification result for a candidate event."""
     event_id: int
-    # Binary validation of detected gaze event
     event_confirmed: bool
-    rejection_reason: Optional[str]  # Only if rejected
-    # Deictic gestures (supports multiple concurrent gestures)
-    deictic_gestures: List[Dict]  # List of {gesture_type, initiator_id, target_type, target_person_id, target_description}
-    # Causality (for QA: C2 task)
+    rejection_reason: Optional[str]
+    deictic_gestures: List[Dict]
     caused_gaze_shift: bool
     responder_ids: List[int]
-    # Description
     description: str
     raw_response: str
 
 
-def extract_video_clip(
-    video_path: str,
-    start_frame: int,
-    end_frame: int,
-    context_frames: int = 10,
-    max_frames: int = 30,
-    output_path: Optional[str] = None,
-) -> str:
-    """
-    Extract video clip around an event.
-    
-    Args:
-        video_path: Path to source video
-        start_frame: Event start frame
-        end_frame: Event end frame
-        context_frames: Frames to include before/after event
-        max_frames: Maximum frames to include
-        output_path: Output path (temp file if None)
-    
-    Returns:
-        Path to extracted clip
-    """
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
-    # Calculate frame range
-    clip_start = max(0, start_frame - context_frames)
-    clip_end = min(total_frames - 1, end_frame + context_frames)
-    
-    # Limit to max_frames
-    if clip_end - clip_start > max_frames:
-        mid = (start_frame + end_frame) // 2
-        clip_start = max(0, mid - max_frames // 2)
-        clip_end = clip_start + max_frames
-    
-    if output_path is None:
-        fd, output_path = tempfile.mkstemp(suffix=".mp4")
-        os.close(fd)
-    
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-    
-    cap.set(cv2.CAP_PROP_POS_FRAMES, clip_start)
-    
-    for _ in range(clip_end - clip_start):
-        ret, frame = cap.read()
-        if not ret:
-            break
-        out.write(frame)
-    
-    cap.release()
-    out.release()
-    
-    return output_path
+# Define the Schema for Gemini JSON Mode
+# Using a dictionary for compatibility with the new SDK's Schema type
+GESTURE_RESPONSE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "event_confirmed": {"type": "BOOLEAN"},
+        "rejection_reason": {"type": "STRING"},
+        "deictic_gestures": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "gesture_type": {"type": "STRING", "enum": ["pointing", "showing", "giving", "reaching"]},
+                    "initiator_id": {"type": "INTEGER"},
+                    "target_type": {"type": "STRING", "enum": ["person", "object", "location"]},
+                    "target_person_id": {"type": "INTEGER"},
+                    "target_description": {"type": "STRING"}
+                },
+                "required": ["gesture_type", "initiator_id", "target_type", "target_description"]
+            }
+        },
+        "caused_gaze_shift": {"type": "BOOLEAN"},
+        "responder_ids": {"type": "ARRAY", "items": {"type": "INTEGER"}},
+        "description": {"type": "STRING"}
+    },
+    "required": ["event_confirmed", "deictic_gestures", "caused_gaze_shift", "responder_ids", "description"]
+}
 
 
-def video_to_frames_base64(
-    video_path: str,
-    start_sec: float = 0,
-    end_sec: float = None,
-    sample_fps: float = 2.0,
-    max_frames: int = 10,
-    resize: Tuple[int, int] = (640, 360),
-) -> List[str]:
+def upload_video_to_gemini(client: 'genai.Client', video_path: str) -> Optional[any]:
     """
-    Extract frames from video at target FPS and convert to base64 for API.
-    
-    Args:
-        video_path: Path to video
-        start_sec: Start time in seconds
-        end_sec: End time in seconds (None = to end)
-        sample_fps: Target sampling FPS (default: 2.0 to match gaze annotation)
-        max_frames: Maximum frames to extract
-        resize: Resize frames to this size
-    
-    Returns:
-        List of base64-encoded JPEG frames
+    Upload a video file to Gemini for processing using genai.Client.
     """
-    cap = cv2.VideoCapture(video_path)
-    video_fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    duration = total_frames / video_fps if video_fps > 0 else 0
+    if not GEMINI_AVAILABLE:
+        return None
     
-    if end_sec is None:
-        end_sec = duration
-    
-    # Calculate frame indices at target sample_fps
-    frame_interval = video_fps / sample_fps  # e.g., 30fps/2fps = every 15th frame
-    
-    start_frame = int(start_sec * video_fps)
-    end_frame = min(int(end_sec * video_fps), total_frames - 1)
-    
-    # Sample frames at sample_fps
-    frame_indices = []
-    current_frame = start_frame
-    while current_frame <= end_frame and len(frame_indices) < max_frames:
-        frame_indices.append(int(current_frame))
-        current_frame += frame_interval
-    
-    frames_b64 = []
-    
-    for idx in frame_indices:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-        ret, frame = cap.read()
-        if not ret:
-            continue
+    try:
+        print(f"Uploading video to Gemini: {video_path}...")
+        # Upload the video file (new SDK syntax)
+        # client.files.upload returns a wrapper/object with .name, .state, etc.
+        video_file = client.files.upload(file=video_path, config={"mime_type": "video/mp4"})
         
-        if resize:
-            frame = cv2.resize(frame, resize)
+        # Wait for file to be processed
+        import time
+        max_wait = 300  # 5 minutes max wait for full video
+        wait_time = 0
+        print(f"Waiting for video processing (current state: {video_file.state})...")
         
-        _, buffer = cv2.imencode('.jpg', frame)
-        b64 = base64.b64encode(buffer).decode('utf-8')
-        frames_b64.append(b64)
-    
-    cap.release()
-    return frames_b64
+        # Note: In new SDK, state is an enum or string. Defensive check.
+        # Usually it's "PROCESSING", "ACTIVE", "FAILED"
+        print(f"Waiting for video processing (current state: {video_file.state})...")
+        
+        while video_file.state == types.FileState.PROCESSING and wait_time < max_wait:
+            time.sleep(5)
+            wait_time += 5
+            # Refresh file status
+            video_file = client.files.get(name=video_file.name)
+            if wait_time % 10 == 0:
+                print(f"  Still processing... ({wait_time}s)")
+        
+        if video_file.state == types.FileState.FAILED:
+            print(f"Video processing failed: {video_file.name}")
+            return None
+            
+        print(f"Video ready: {video_file.name}")
+        return video_file
+    except Exception as e:
+        print(f"Error uploading video: {e}")
+        return None
+
+
+def delete_uploaded_file(client: 'genai.Client', file_obj) -> None:
+    """Delete an uploaded file from Gemini to clean up."""
+    if file_obj is not None:
+        try:
+            client.files.delete(name=file_obj.name)
+            print(f"Deleted remote file: {file_obj.name}")
+        except Exception:
+            pass
 
 
 def build_classification_prompt(event: Dict, gaze_context: Dict) -> str:
     """
-    Build a structured prompt for Gemini to validate and classify gestures.
+    Build a structured prompt for Gemini using timestamps.
     """
     event_type = event.get('event_type', 'unknown')
     persons = event.get('persons_involved', [])
+    start_time = event.get('start_time', 0)
+    end_time = event.get('end_time', 0)
     
-    # Event type definitions
+    # Add context window (1s before/after)
+    focus_start = max(0, start_time - 1.0)
+    focus_end = end_time + 1.0
+    
     event_definitions = {
         "sudden_gaze_shift": "A person suddenly changed where they're looking",
         "joint_attention": "Multiple people looking at the same target",
@@ -211,101 +181,66 @@ def build_classification_prompt(event: Dict, gaze_context: Dict) -> str:
     }
     event_desc = event_definitions.get(event_type, event_type)
     
-    prompt = f"""Analyze these video frames to validate a detected social interaction event.
-
-## About These Frames
-- These frames have annotations: Colored bounding boxes (P0, P1, P2...) and gaze direction lines.
-- **Note on Gaze Accuracy**: Gaze lines are approximate. Do not be overly strict about the exact endpoint of the line. Prioritize the logical context and the general trajectory of the gaze to determine the target.
-
-## Event Detected
-- Type: **{event_type}** = {event_desc}
-- Time: {event.get('start_time', 0):.2f}s - {event.get('end_time', 0):.2f}s
-- Persons: {persons}
-
-## Tasks
-1. **Validate**: Do gaze patterns support this {event_type}?
-2. **Detect Gestures**: List ALL deictic gestures (pointing, showing, giving, reaching)
-3. **Causality**: Did any gesture cause gaze shifts?
-
-## Response Format (JSON only)
-
-{{
-    "event_confirmed": true | false,
-    "rejection_reason": "<only if rejected>",
+    prompt = f"""Analyze the uploaded video for the following event.
     
-    "deictic_gestures": [
-        {{
-            "gesture_type": "pointing" | "showing" | "giving" | "reaching",
-            "initiator_id": <person ID>,
-            "target_type": "person" | "object" | "location",
-            "target_person_id": <ID if person, else null>,
-            "target_description": "<what/who>"
-        }}
-    ],
+    ## Focus Segment
+    **TIMESTAMPS: {focus_start:.2f}s to {focus_end:.2f}s**
+    Strictly focus your analysis on this time window.
     
-    "caused_gaze_shift": true | false,
-    "responder_ids": [<person IDs who shifted gaze>],
+    ## Event Details
+    - Type: **{event_type}** ({event_desc})
+    - Persons Involved IDs: {persons}
+    - Visuals: The video has bounding boxes and gaze lines. Use them to infer targets.
     
-    "description": "<what's happening>"
-}}
-
-Return empty array for deictic_gestures if none detected. Respond with ONLY a valid JSON object. No reasoning or introductory text.
-"""
+    ## Tasks
+    1. **Validate**: Is the `{event_type}` event genuinely happening during this segment?
+    2. **Detect Gestures**: Identify any DEICTIC gestures (pointing, showing, giving, reaching) performed by the people involved.
+    3. **Causality**: Did a gesture CAUSE the gaze event?
+    """
     return prompt
 
 
 def classify_with_gemini(
-    frames_b64: List[str],
+    client: 'genai.Client',
     prompt: str,
-    model_name: str = "gemini-2.0-flash",
+    video_file: any,
+    model_name: str = "gemini-2.0-flash-exp", 
 ) -> Tuple[str, Dict]:
     """
-    Send frames and prompt to Gemini for classification.
-    
-    Returns:
-        Tuple of (raw_response, parsed_json)
+    Send prompt with PRE-UPLOADED video to Gemini using genai.Client.
+    Uses Native JSON Mode for output.
     """
     if not GEMINI_AVAILABLE:
         return "ERROR: Gemini not available", {}
     
-    model = genai.GenerativeModel(model_name)
-    
-    # Build content with images
-    content = []
-    for b64 in frames_b64:
-        content.append({
-            "inline_data": {
-                "mime_type": "image/jpeg",
-                "data": b64
-            }
-        })
-    content.append(prompt)
+    # Configure generation config using types (new SDK)
+    config = types.GenerateContentConfig(
+        temperature=0.2,
+        response_mime_type="application/json",
+        response_schema=GESTURE_RESPONSE_SCHEMA
+    )
     
     try:
-        response = model.generate_content(content)
-        raw_text = response.text.strip()
+        # Pass the file object directly in contents list (new SDK handles it)
+        response = client.models.generate_content(
+            model=model_name,
+            contents=[video_file, prompt],
+            config=config
+        )
         
-        # Parse JSON from response
-        # Handle case where response might have markdown code blocks
-        if raw_text.startswith("```"):
-            lines = raw_text.split("\n")
-            json_lines = []
-            in_json = False
-            for line in lines:
-                if line.startswith("```json"):
-                    in_json = True
-                    continue
-                if line.startswith("```"):
-                    in_json = False
-                    continue
-                if in_json:
-                    json_lines.append(line)
-            raw_text = "\n".join(json_lines)
-        
-        parsed = json.loads(raw_text)
-        return response.text, parsed
+        # New SDK response.text accesses the generated text
+        raw_text = response.text
+        try:
+             # Try parsing manually first to be safe
+             parsed = json.loads(raw_text)
+        except:
+             # If manual parsing fails, check if the SDK did something weird
+             return raw_text, {}
+
+        return raw_text, parsed
         
     except Exception as e:
+        print(f"Gemini API Error: {e}")
         return f"ERROR: {str(e)}", {}
 
 
@@ -314,35 +249,33 @@ def classify_events(
     events: List[Dict],
     gaze_data: Dict,
     api_key: Optional[str] = None,
-    model_name: str = "gemini-2.0-flash",
+    model_name: str = "gemini-2.0-flash-exp",
     max_events: Optional[int] = None,
-    sample_fps: float = 2.0,
+    sample_fps: float = None, 
     viz_video_path: Optional[str] = None,
 ) -> List[GestureClassification]:
     """
-    Classify all candidate events using Gemini.
-    
-    Args:
-        video_path: Path to original video (used if viz_video_path not provided)
-        events: List of candidate events to classify
-        gaze_data: Gaze annotation data
-        api_key: Gemini API key
-        model_name: Gemini model to use
-        max_events: Maximum events to classify
-        sample_fps: FPS for frame extraction (default: 2.0 to match gaze annotation)
-        viz_video_path: Path to visualization video with annotations overlay.
-                        If None, will auto-detect by looking for *_viz.mp4 or *_sam3rf_viz.mp4
+    Classify all candidate events using Single Video Upload + Long Context.
+    Uses genai.Client.
     """
-    if api_key:
-        genai.configure(api_key=api_key)
+    if not GEMINI_AVAILABLE:
+        print("ERROR: google-genai package not installed. Skipping classification.")
+        return []
+
+    # Initialize Client (New SDK)
+    if not api_key:
+         print("ERROR: No API key provided")
+         return []
+         
+    client = genai.Client(api_key=api_key)
     
     results = []
     events_to_process = events[:max_events] if max_events else events
     
-    # Try to find visualization video if not provided
+    # 1. Determine which video to use
     if viz_video_path is None:
         base_name = os.path.splitext(video_path)[0]
-        # Try common visualization video suffixes
+        # Check standard visualization paths
         for suffix in ['_viz.mp4', '_sam3rf_viz.mp4']:
             candidate = base_name + suffix
             if os.path.exists(candidate):
@@ -350,62 +283,72 @@ def classify_events(
                 print(f"Using visualization video: {viz_video_path}")
                 break
     
-    # Use viz video if available, otherwise use raw video
+    # Validation
     source_video = viz_video_path if viz_video_path and os.path.exists(viz_video_path) else video_path
     if source_video == video_path:
         print(f"Using raw video (no visualization found): {video_path}")
     
-    # Get video FPS for time conversion
-    cap = cv2.VideoCapture(source_video)
-    video_fps = cap.get(cv2.CAP_PROP_FPS)
-    cap.release()
-    
-    for i, event in enumerate(events_to_process):
-        print(f"Classifying event {i+1}/{len(events_to_process)}: {event.get('event_type')}")
+    # 2. Upload Video ONCE
+    print("Step 1: Uploading full video to Gemini...")
+    video_file = upload_video_to_gemini(client, source_video)
+    if not video_file:
+        print("CRITICAL: Failed to upload video. Aborting.")
+        return []
         
-        # Convert frame indices to time (use original frame indices from gaze annotation)
-        start_time = event["start_time"] - 1.0  # 1 second context before
-        end_time = event["end_time"] + 1.0  # 1 second context after
+    try:
+        # 3. Iterate Events
+        print(f"Step 2: Processing {len(events_to_process)} events using Long Context...")
         
-        # Extract frames from visualization video (has person IDs and gaze arrows drawn)
-        frames_b64 = video_to_frames_base64(
-            source_video,
-            start_sec=max(0, start_time),
-            end_sec=end_time,
-            sample_fps=sample_fps,
-            max_frames=10,  # ~5 seconds at 2fps
-        )
-        
-        # Build prompt
-        prompt = build_classification_prompt(event, gaze_data)
-        
-        # Query Gemini
-        raw_response, parsed = classify_with_gemini(frames_b64, prompt, model_name)
-        
-        if parsed:
-            result = GestureClassification(
-                event_id=event.get("event_id", i),
-                event_confirmed=parsed.get("event_confirmed", False),
-                rejection_reason=parsed.get("rejection_reason"),
-                deictic_gestures=parsed.get("deictic_gestures", []),
-                caused_gaze_shift=parsed.get("caused_gaze_shift", False),
-                responder_ids=parsed.get("responder_ids", []),
-                description=parsed.get("description", ""),
-                raw_response=raw_response,
+        for i, event in enumerate(events_to_process):
+            # Build prompt with timestamps
+            prompt = build_classification_prompt(event, gaze_data)
+            
+            # Query Gemini
+            print(f"  [{i+1}/{len(events_to_process)}] {event.get('event_type')} @ {event.get('start_time'):.1f}s")
+            
+            raw_response, parsed = classify_with_gemini(
+                client=client,
+                prompt=prompt,
+                video_file=video_file,
+                model_name=model_name
             )
-        else:
-            result = GestureClassification(
-                event_id=event.get("event_id", i),
-                event_confirmed=False,
-                rejection_reason="Failed to parse Gemini response",
-                deictic_gestures=[],
-                caused_gaze_shift=False,
-                responder_ids=[],
-                description="",
-                raw_response=raw_response,
-            )
-        
-        results.append(result)
+            
+            if parsed:
+                # Create result object with validated data
+                result = GestureClassification(
+                    event_id=event.get("event_id", i),
+                    event_confirmed=parsed.get("event_confirmed", False),
+                    rejection_reason=parsed.get("rejection_reason"),
+                    deictic_gestures=parsed.get("deictic_gestures", []),
+                    caused_gaze_shift=parsed.get("caused_gaze_shift", False),
+                    responder_ids=parsed.get("responder_ids", []),
+                    description=parsed.get("description", ""),
+                    raw_response=raw_response,
+                )
+            else:
+                # Handle failure
+                result = GestureClassification(
+                    event_id=event.get("event_id", i),
+                    event_confirmed=False,
+                    rejection_reason="Failed to parse Gemini response or API error",
+                    deictic_gestures=[],
+                    caused_gaze_shift=False,
+                    responder_ids=[],
+                    description="",
+                    raw_response=raw_response,
+                )
+            
+            results.append(result)
+            
+            # Rate limit politeness
+            # gemini-2.0-flash-exp has 10 RPM limit. Sleep 10s to be safe (6 RPM).
+            import time
+            time.sleep(10)
+            
+    finally:
+        # 4. Cleanup
+        print("Cleaning up remote video file...")
+        delete_uploaded_file(client, video_file)
     
     return results
 
@@ -471,7 +414,7 @@ def process_single_video(
     events_json: str,
     output_path: str,
     api_key: str,
-    model_name: str = "gemini-2.0-flash",
+    model_name: str = "gemini-2.5-pro",
     gaze_json: Optional[str] = None,
     max_events: Optional[int] = None,
 ) -> bool:
@@ -580,8 +523,8 @@ Examples:
     # Common args
     parser.add_argument("--output_dir", type=str, default=None, help="Output directory for gesture JSONs")
     parser.add_argument("--api_key", type=str, default=None, help="Gemini API key (or set GOOGLE_API_KEY env)")
-    parser.add_argument("--model", type=str, default="gemini-2.0-flash", help="Gemini model to use")
-    parser.add_argument("--max_events", type=int, default=None, help="Max events to classify per video")
+    parser.add_argument("--model", type=str, default="gemini-2.0-flash-exp", help="Gemini model to use")
+    parser.add_argument("--max_events", type=int, default=500, help="Max events to classify per video (default: 500)")
     parser.add_argument("--skip_existing", action="store_true", help="Skip if output file already exists")
     
     args = parser.parse_args()
