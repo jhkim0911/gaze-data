@@ -107,6 +107,67 @@ GESTURE_RESPONSE_SCHEMA = {
 }
 
 
+SYSTEM_INSTRUCTION = """You are a video gesture classifier expert.
+The video contains visual overlays (bounding boxes with P0, P1 labels and gaze lines).
+Use these IDs to identify the individuals specified in the prompt.
+Your task is to analyze specific time segments of a video to detect social gestures.
+Focus on DEICTIC gestures like pointing, showing, giving, and reaching.
+Use the provided bounding box context and timestamps to be precise.
+"""
+
+def setup_caching_strategy(client: 'genai.Client', video_file: any, model_name: str) -> Tuple[Optional[any], int]:
+    """
+    Setup caching, prioritizing usage for Gemini 3 High-Res.
+    Always attempts to cache, adding padding if necessary.
+    Returns: (cache_object, sleep_interval)
+    """
+    MIN_CACHE_TOKENS = 32768
+    
+    try:
+        print("Creating High-Res Video Part for Caching...")
+        # Create High-Res Part to force ~120k tokens
+        video_part = types.Part.from_uri(
+            file_uri=video_file.uri,
+            mime_type=video_file.mime_type,
+            media_resolution="high"
+        )
+        
+        print("Checking token count for caching eligibility...")
+        count_resp = client.models.count_tokens(
+            model=model_name,
+            contents=[video_part, SYSTEM_INSTRUCTION]
+        )
+        total_tokens = count_resp.total_tokens
+        print(f"Total Tokens (High-Res Video + System): {total_tokens}")
+        
+        final_system_instruction = SYSTEM_INSTRUCTION
+        
+        if total_tokens < MIN_CACHE_TOKENS:
+            shortfall = MIN_CACHE_TOKENS - total_tokens + 500 # Generous buffer
+            print(f"Token count {total_tokens} < {MIN_CACHE_TOKENS}. Padding with ~{shortfall} tokens.")
+            # 1 token approx 4 chars.
+            padding = " " * (shortfall * 5) 
+            final_system_instruction += f"\n\n<!-- PADDING TO REACH CACHE LIMIT -->\n{padding}"
+        
+        # Create Cache
+        print("Creating Context Cache...")
+        cache = client.caches.create(
+            model=model_name,
+            config={
+                "contents": [video_part],
+                "system_instruction": final_system_instruction,
+                "ttl": "3600s"
+            }
+        )
+        print(f"Cache created: {cache.name}")
+        return cache, 10
+        
+    except Exception as e:
+        print(f"Failed to setup cache strategy: {e}")
+        # Fallback to standard upload if cache fails seriously
+        return None, 30
+
+
 def upload_video_to_gemini(client: 'genai.Client', video_path: str) -> Optional[any]:
     """
     Upload a video file to Gemini for processing using genai.Client.
@@ -138,8 +199,8 @@ def upload_video_to_gemini(client: 'genai.Client', video_path: str) -> Optional[
             if wait_time % 10 == 0:
                 print(f"  Still processing... ({wait_time}s)")
         
-        if video_file.state == types.FileState.FAILED:
-            print(f"Video processing failed: {video_file.name}")
+        if video_file.state != types.FileState.ACTIVE:
+            print(f"CRITICAL: Video state is {video_file.state.name}, expected ACTIVE.")
             return None
             
         print(f"Video ready: {video_file.name}")
@@ -181,19 +242,19 @@ def build_classification_prompt(event: Dict, gaze_context: Dict) -> str:
     }
     event_desc = event_definitions.get(event_type, event_type)
     
-    prompt = f"""Analyze the uploaded video for the following event.
+    prompt = f"""As a "microscope" for the video, analyze the following segment:
     
     ## Focus Segment
     **TIMESTAMPS: {focus_start:.2f}s to {focus_end:.2f}s**
-    Strictly focus your analysis on this time window.
+    Strictly focus your analysis on this time window within the full video.
     
     ## Event Details
     - Type: **{event_type}** ({event_desc})
     - Persons Involved IDs: {persons}
-    - Visuals: The video has bounding boxes and gaze lines. Use them to infer targets.
+    - Visuals: Use the P0, P1 bounding box labels and gaze lines to confirm identity.
     
     ## Tasks
-    1. **Validate**: Is the `{event_type}` event genuinely happening during this segment?
+    1. **Validate**: Is the `{event_type}` event genuinely happening?
     2. **Detect Gestures**: Identify any DEICTIC gestures (pointing, showing, giving, reaching) performed by the people involved.
     3. **Causality**: Did a gesture CAUSE the gaze event?
     """
@@ -204,7 +265,8 @@ def classify_with_gemini(
     client: 'genai.Client',
     prompt: str,
     video_file: any,
-    model_name: str = "gemini-2.0-flash-exp", 
+    model_name: str = "gemini-3-flash-preview", 
+    cache_name: Optional[str] = None,
 ) -> Tuple[str, Dict]:
     """
     Send prompt with PRE-UPLOADED video to Gemini using genai.Client.
@@ -214,17 +276,35 @@ def classify_with_gemini(
         return "ERROR: Gemini not available", {}
     
     # Configure generation config using types (new SDK)
-    config = types.GenerateContentConfig(
-        temperature=0.2,
-        response_mime_type="application/json",
-        response_schema=GESTURE_RESPONSE_SCHEMA
-    )
+    # Configure generation config using types (new SDK)
+    config_dict = {
+        "temperature": 0.2,
+        "response_mime_type": "application/json",
+        "response_schema": GESTURE_RESPONSE_SCHEMA,
+        "media_resolution": "high",
+    }
+    
+    # Add Thinking Config for Gemini 3
+    if "gemini-3" in model_name:
+         # Note: Check if SDK supports ThinkingConfig. If not, pass as dict.
+         # Assuming recent SDK has it or accepts dict in thinking_config
+         config_dict["thinking_config"] = {"thinking_level": "medium"}
+
+    # Use Cache if available
+    contents = []
+    if cache_name:
+        config_dict["cached_content"] = cache_name
+        contents = [prompt]
+    else:
+        contents = [video_file, prompt]
+        
+    config = types.GenerateContentConfig(**config_dict)
     
     try:
         # Pass the file object directly in contents list (new SDK handles it)
         response = client.models.generate_content(
             model=model_name,
-            contents=[video_file, prompt],
+            contents=contents,
             config=config
         )
         
@@ -249,7 +329,7 @@ def classify_events(
     events: List[Dict],
     gaze_data: Dict,
     api_key: Optional[str] = None,
-    model_name: str = "gemini-2.0-flash-exp",
+    model_name: str = "gemini-3-flash-preview",
     max_events: Optional[int] = None,
     sample_fps: float = None, 
     viz_video_path: Optional[str] = None,
@@ -294,10 +374,14 @@ def classify_events(
     if not video_file:
         print("CRITICAL: Failed to upload video. Aborting.")
         return []
+    
+    # 2.5 Setup Caching Strategy
+    cache, sleep_interval = setup_caching_strategy(client, video_file, model_name)
         
     try:
         # 3. Iterate Events
-        print(f"Step 2: Processing {len(events_to_process)} events using Long Context...")
+        mode_str = "Context Caching" if cache else "Standard Upload"
+        print(f"Step 2: Processing {len(events_to_process)} events using {mode_str} (Request Sleep: {sleep_interval}s)...")
         
         for i, event in enumerate(events_to_process):
             # Build prompt with timestamps
@@ -309,8 +393,9 @@ def classify_events(
             raw_response, parsed = classify_with_gemini(
                 client=client,
                 prompt=prompt,
-                video_file=video_file,
-                model_name=model_name
+                video_file=video_file if not cache else None,
+                model_name=model_name,
+                cache_name=cache.name if cache else None
             )
             
             if parsed:
@@ -341,13 +426,20 @@ def classify_events(
             results.append(result)
             
             # Rate limit politeness
-            # gemini-2.0-flash-exp has 10 RPM limit. Sleep 10s to be safe (6 RPM).
+            # Dynamic sleep based on caching strategy
             import time
-            time.sleep(10)
+            time.sleep(sleep_interval)
             
     finally:
         # 4. Cleanup
-        print("Cleaning up remote video file...")
+        print("Cleaning up resources...")
+        if cache:
+             try:
+                 client.caches.delete(name=cache.name)
+                 print(f"Deleted cache: {cache.name}")
+             except Exception as e:
+                 print(f"Error deleting cache: {e}")
+                 
         delete_uploaded_file(client, video_file)
     
     return results
@@ -414,7 +506,7 @@ def process_single_video(
     events_json: str,
     output_path: str,
     api_key: str,
-    model_name: str = "gemini-2.5-pro",
+    model_name: str = "gemini-3-flash-preview",
     gaze_json: Optional[str] = None,
     max_events: Optional[int] = None,
 ) -> bool:
@@ -523,7 +615,7 @@ Examples:
     # Common args
     parser.add_argument("--output_dir", type=str, default=None, help="Output directory for gesture JSONs")
     parser.add_argument("--api_key", type=str, default=None, help="Gemini API key (or set GOOGLE_API_KEY env)")
-    parser.add_argument("--model", type=str, default="gemini-2.0-flash-exp", help="Gemini model to use")
+    parser.add_argument("--model", type=str, default="gemini-3-flash-preview", help="Gemini model to use")
     parser.add_argument("--max_events", type=int, default=500, help="Max events to classify per video (default: 500)")
     parser.add_argument("--skip_existing", action="store_true", help="Skip if output file already exists")
     
