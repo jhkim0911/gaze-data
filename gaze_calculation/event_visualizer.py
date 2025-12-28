@@ -49,6 +49,14 @@ EVENT_SHORT_LABELS = {
     "mutual_gaze": "MUTUAL GAZE",
 }
 
+# Colors for gesture types (BGR)
+GESTURE_COLORS = {
+    "pointing": (255, 165, 0),     # Orange
+    "showing": (0, 255, 255),      # Yellow
+    "giving": (0, 215, 255),       # Gold
+    "reaching": (147, 20, 255),    # Pink
+}
+
 
 def get_events_at_time(events: List[Dict], time_sec: float) -> List[Dict]:
     """Get all events occurring at a given time."""
@@ -102,31 +110,148 @@ def draw_event_overlay(
         color = EVENT_COLORS.get(event_type, (255, 255, 255))
         label = EVENT_SHORT_LABELS.get(event_type, event_type.upper())
         
-        # Build compact single-line text: ● JOINT_ATTN P0,P1 [✓]
+        # Build compact single-line text: ● JOINT_ATTN P0,P1
         persons_text = f"P{','.join(map(str, persons))}" if persons else ""
+        line_text = f"{label} {persons_text}"
         
-        # Check Gemini validation status
-        status = ""
+        # Determine text color based on Gemini validation status
+        # Blue = confirmed, Red = rejected, White = no classification
+        text_color = (255, 255, 255)  # Default white
         if classifications and event_id in classifications:
             cls = classifications[event_id]
             if cls.get("event_confirmed"):
-                status = "[✓]"
+                text_color = (255, 0, 0)    # Blue - confirmed
             else:
-                status = "[✗]"
+                text_color = (0, 0, 255)    # Red - rejected
         
-        line_text = f"{label} {persons_text} {status}"
-        
-        # Colored indicator circle
+        # Colored indicator circle (event type color)
         cv2.circle(frame, (box_x + 10, y_pos - 4), 6, color, -1)
         
-        # Event text
+        # Event text (colored by confirmation status)
         cv2.putText(
             frame, line_text,
             (box_x + 22, y_pos),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, text_color, 1, cv2.LINE_AA
         )
         
         y_pos += 22
+    
+    return frame
+
+
+def draw_gesture_overlay(
+    frame: np.ndarray,
+    events: List[Dict],
+    classifications: Optional[Dict] = None,
+) -> np.ndarray:
+    """Draw gesture information overlay at bottom-left.
+    
+    Shows deictic_gestures and responder_ids for active events.
+    Stacks upward when multiple gestures exist.
+    """
+    if not classifications:
+        return frame
+    
+    h, w = frame.shape[:2]
+    
+    # Collect all gestures from active events
+    all_gestures = []
+    for event in events:
+        event_id = event.get("event_id")
+        if event_id in classifications:
+            cls = classifications[event_id]
+            deictic = cls.get("deictic_gestures", [])
+            responder_ids = cls.get("responder_ids", [])
+            
+            for gesture in deictic:
+                all_gestures.append({
+                    "gesture_type": gesture.get("gesture_type", "unknown"),
+                    "initiator_id": gesture.get("initiator_id"),
+                    "target_type": gesture.get("target_type"),
+                    "target_description": gesture.get("target_description"),
+                    "responder_ids": responder_ids,
+                })
+    
+    # If no gestures found but events are active, show null
+    if not all_gestures and events:
+        # Check if any active event has classification
+        has_classification = any(
+            event.get("event_id") in classifications for event in events
+        )
+        if has_classification:
+            all_gestures = [None]  # Placeholder for "null" display
+    
+    if not all_gestures:
+        return frame
+    
+    # Calculate box dimensions
+    line_height = 22
+    box_padding = 10
+    box_w = 350
+    num_lines = len(all_gestures)
+    box_h = box_padding + num_lines * line_height
+    
+    # Position at bottom-left, stacking upward
+    box_x = 10
+    box_y = h - box_h - 10
+    
+    # Semi-transparent background
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (box_x, box_y), (box_x + box_w, box_y + box_h), (0, 0, 0), -1)
+    frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
+    
+    # Draw title
+    # cv2.putText(frame, "GESTURES", (box_x + 5, box_y + 15),
+    #             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1, cv2.LINE_AA)
+    
+    # Draw each gesture (stacking upward from bottom)
+    y_pos = box_y + box_padding + line_height - 5
+    for gesture in all_gestures:
+        if gesture is None:
+            # Show "null" when no gestures
+            cv2.putText(
+                frame, "GESTURE: null",
+                (box_x + 10, y_pos),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1, cv2.LINE_AA
+            )
+        else:
+            g_type = gesture["gesture_type"].upper()
+            initiator = gesture.get("initiator_id")
+            target_type = gesture.get("target_type", "")
+            target_desc = gesture.get("target_description", "")[:20]  # Truncate
+            responders = gesture.get("responder_ids", [])
+            
+            color = GESTURE_COLORS.get(gesture["gesture_type"], (255, 255, 255))
+            
+            # Build text: "POINTING P1 -> object (book) | resp: P2,P3"
+            text_parts = [g_type]
+            if initiator is not None:
+                text_parts.append(f"P{initiator}")
+            if target_type:
+                if target_type == "person" and gesture.get("target_person_id") is not None:
+                    text_parts.append(f"-> P{gesture['target_person_id']}")
+                elif target_desc:
+                    text_parts.append(f"-> {target_desc}")
+                else:
+                    text_parts.append(f"-> {target_type}")
+            
+            line_text = " ".join(text_parts)
+            
+            if responders:
+                resp_text = f" | resp: P{','.join(map(str, responders))}"
+                line_text += resp_text
+            
+            # Colored indicator
+            cv2.circle(frame, (box_x + 10, y_pos - 4), 5, color, -1)
+            
+            # Text
+            cv2.putText(
+                frame, line_text,
+                (box_x + 22, y_pos),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA
+            )
+        
+        y_pos += line_height
     
     return frame
 
@@ -157,11 +282,14 @@ def visualize_events(
     
     # Load Gemini classifications if available
     classifications = {}
+    sample_fps = None
     if gestures_json_path and os.path.exists(gestures_json_path):
         with open(gestures_json_path, 'r') as f:
             gestures_data = json.load(f)
         for cls in gestures_data.get("classifications", []):
             classifications[cls["event_id"]] = cls
+        # Get sample_fps from gesture data for accurate timing
+        sample_fps = gestures_data.get("sample_fps")
         print(f"Loaded {len(classifications)} Gemini classifications from: {gestures_json_path}")
     
     # Open video
@@ -175,7 +303,10 @@ def visualize_events(
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
-    print(f"Video: {total_frames} frames @ {video_fps:.1f}fps, {width}x{height}")
+    # Use sample_fps from data if available, otherwise use video fps
+    # The viz video is at sample_fps (typically 2.0fps)
+    timing_fps = sample_fps or events_data.get("sample_fps") or video_fps
+    print(f"Video: {total_frames} frames @ {video_fps:.1f}fps (timing: {timing_fps:.1f}fps), {width}x{height}")
     
     # Create output
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
@@ -188,14 +319,17 @@ def visualize_events(
         if not ret:
             break
         
-        # Calculate time (assuming video is already at target fps)
-        time_sec = frame_idx / video_fps
+        # Calculate time using sample_fps (the fps the video was sampled at)
+        time_sec = frame_idx / timing_fps
         
         # Get active events at this time
         active_events = get_events_at_time(events, time_sec)
         
         # Draw overlay (with Gemini classifications if available)
         frame = draw_event_overlay(frame, active_events, time_sec, frame_idx, classifications)
+        
+        # Draw gesture overlay at bottom-left (only during event duration)
+        frame = draw_gesture_overlay(frame, active_events, classifications)
         
         out.write(frame)
         frame_idx += 1
@@ -237,6 +371,7 @@ def batch_visualize(
     video_dir: str,
     events_dir: str,
     output_dir: str,
+    gestures_dir: Optional[str] = None,
 ) -> None:
     """
     Batch process all visualization videos in a directory.
@@ -280,12 +415,30 @@ def batch_visualize(
             print(f"Skipping {base_name}: no events JSON found")
             continue
         
-        output_name = base_name.replace("_viz.mp4", "_events_viz.mp4")
-        output_name = output_name.replace("_sam3rf_viz.mp4", "_events_viz.mp4")
+        # Find matching gestures JSON if gestures_dir provided
+        gestures_path = None
+        if gestures_dir:
+            # Strip _sam3rf_viz.mp4 first, then _viz.mp4 to get base name
+            gestures_base = base_name.replace("_sam3rf_viz.mp4", "_gestures.json")
+            if gestures_base == base_name:  # Didn't match, try other pattern
+                gestures_base = base_name.replace("_viz.mp4", "_gestures.json")
+            gestures_candidate = os.path.join(gestures_dir, gestures_base)
+            if os.path.exists(gestures_candidate):
+                gestures_path = gestures_candidate
+            else:
+                # When gestures_dir is provided, skip videos without gesture data
+                print(f"Skipping {base_name}: no gestures JSON found (gesture mode)")
+                continue
+        
+        # Output name reflects whether gestures are included
+        suffix = "_full_viz.mp4" if gestures_path else "_events_viz.mp4"
+        output_name = base_name.replace("_sam3rf_viz.mp4", suffix)
+        if output_name == base_name:  # Didn't match, try other pattern
+            output_name = base_name.replace("_viz.mp4", suffix)
         output_path = os.path.join(output_dir, output_name)
         
         print(f"\nProcessing: {base_name}")
-        visualize_events(viz_path, events_path, output_path)
+        visualize_events(viz_path, events_path, output_path, gestures_path)
 
 
 def main():
@@ -295,6 +448,7 @@ def main():
     parser.add_argument("--gestures_json", type=str, default=None, help="Gemini gestures JSON (optional)")
     parser.add_argument("--video_dir", type=str, default=None, help="Directory with *_viz.mp4 for batch")
     parser.add_argument("--events_dir", type=str, default=None, help="Directory with *_events.json for batch")
+    parser.add_argument("--gestures_dir", type=str, default=None, help="Directory with *_gestures.json for batch (optional)")
     parser.add_argument("--output_dir", type=str, required=True, help="Output directory (required)")
     
     args = parser.parse_args()
@@ -326,7 +480,7 @@ def main():
     elif args.video_dir:
         # Batch mode
         events_dir = args.events_dir or args.video_dir
-        batch_visualize(args.video_dir, events_dir, args.output_dir)
+        batch_visualize(args.video_dir, events_dir, args.output_dir, args.gestures_dir)
     
     else:
         parser.print_help()

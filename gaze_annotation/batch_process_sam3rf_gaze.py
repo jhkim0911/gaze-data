@@ -39,6 +39,8 @@ def main():
     parser.add_argument("--sample_fps", type=float, default=2.0, help="Process at this fps (default: 2.0)")
     parser.add_argument("--gaze_checkpoint", type=str,
                         default="/projects/illinois/eng/cs/jrehg/users/xucao2/ChildGaze/checkpoints/GazeAnywhere/gazeanywhere.pth")
+    parser.add_argument("--split", type=int, default=1, help="Total number of parallel splits (default: 1 = no split)")
+    parser.add_argument("--split_id", type=int, default=1, help="Which split to run (1-indexed, 1 to --split)")
     
     args = parser.parse_args()
     
@@ -57,6 +59,15 @@ def main():
     if len(video_paths) == 0:
         print("No videos found!")
         return
+    
+    # Apply split filtering for parallel processing
+    if args.split > 1:
+        if args.split_id < 1 or args.split_id > args.split:
+            print(f"ERROR: --split_id must be between 1 and {args.split}")
+            return
+        # Filter to only videos for this split (0-indexed internally)
+        video_paths = [v for i, v in enumerate(video_paths) if i % args.split == (args.split_id - 1)]
+        print(f"Split {args.split_id}/{args.split}: Processing {len(video_paths)} videos")
     
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)

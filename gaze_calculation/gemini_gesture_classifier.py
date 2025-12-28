@@ -24,14 +24,44 @@ import json
 import os
 import sys
 import tempfile
+import time
+import random
+import functools
+from concurrent.futures import ThreadPoolExecutor
 
 # Force unbuffered output for SLURM/logging
 sys.stdout.reconfigure(line_buffering=True)
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(x, **kwargs): return x
 import cv2
 import numpy as np
+
+def retry_with_backoff(retries=5, initial_delay=5, backoff_factor=2):
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            delay = initial_delay
+            for i in range(retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    msg = str(e)
+                    if "429" in msg or "RESOURCE_EXHAUSTED" in msg or "500" in msg:
+                        if i == retries - 1: raise
+                        sleep = delay + random.uniform(0, 1)
+                        print(f"API Error ({msg}). Retrying in {sleep:.1f}s...")
+                        time.sleep(sleep)
+                        delay *= backoff_factor
+                    else:
+                        raise
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
 
 # Load .env file from project root
 ENV_FILE_PATH = "/u/arkimjh/code/ECCV-jh/.env"
@@ -56,15 +86,6 @@ except ImportError:
 
 
 
-# Deictic gesture taxonomy (these require visual analysis - can't be detected from gaze alone)
-DEICTIC_GESTURES = {
-    "pointing": "Directing attention to an object or location by pointing",
-    "showing": "Presenting or displaying an object to another person",
-    "giving": "Offering or handing over an object to another person",
-    "reaching": "Extending arm to acquire or touch an object",
-}
-
-
 @dataclass
 class GestureClassification:
     """Classification result for a candidate event."""
@@ -79,123 +100,59 @@ class GestureClassification:
 
 
 # Define the Schema for Gemini JSON Mode
-# Using a dictionary for compatibility with the new SDK's Schema type
-GESTURE_RESPONSE_SCHEMA = {
-    "type": "OBJECT",
-    "properties": {
-        "event_confirmed": {"type": "BOOLEAN"},
-        "rejection_reason": {"type": "STRING"},
-        "deictic_gestures": {
-            "type": "ARRAY",
-            "items": {
-                "type": "OBJECT",
-                "properties": {
-                    "gesture_type": {"type": "STRING", "enum": ["pointing", "showing", "giving", "reaching"]},
-                    "initiator_id": {"type": "INTEGER"},
-                    "target_type": {"type": "STRING", "enum": ["person", "object", "location"]},
-                    "target_person_id": {"type": "INTEGER"},
-                    "target_description": {"type": "STRING"}
+# Using types.Schema for better SDK enforcement
+GESTURE_RESPONSE_SCHEMA = types.Schema(
+    type="OBJECT",
+    properties={
+        "event_confirmed": types.Schema(type="BOOLEAN"),
+        "rejection_reason": types.Schema(type="STRING", nullable=True),
+        "deictic_gestures": types.Schema(
+            type="ARRAY",
+            items=types.Schema(
+                type="OBJECT",
+                properties={
+                    "gesture_type": types.Schema(type="STRING", enum=["pointing", "showing", "giving", "reaching"]),
+                    "initiator_id": types.Schema(type="INTEGER"),
+                    "target_type": types.Schema(type="STRING", enum=["person", "object", "location"]),
+                    "target_person_id": types.Schema(type="INTEGER", nullable=True),
+                    "target_description": types.Schema(type="STRING")
                 },
-                "required": ["gesture_type", "initiator_id", "target_type", "target_description"]
-            }
-        },
-        "caused_gaze_shift": {"type": "BOOLEAN"},
-        "responder_ids": {"type": "ARRAY", "items": {"type": "INTEGER"}},
-        "description": {"type": "STRING"}
+                required=["gesture_type", "initiator_id", "target_type", "target_description"]
+            )
+        ),
+        "caused_gaze_shift": types.Schema(type="BOOLEAN"),
+        "responder_ids": types.Schema(type="ARRAY", items=types.Schema(type="INTEGER")),
+        "description": types.Schema(type="STRING")
     },
-    "required": ["event_confirmed", "deictic_gestures", "caused_gaze_shift", "responder_ids", "description"]
-}
+    required=["event_confirmed", "deictic_gestures", "caused_gaze_shift", "responder_ids", "description"]
+)
 
-
-SYSTEM_INSTRUCTION = """You are a video gesture classifier expert.
-The video contains visual overlays (bounding boxes with P0, P1 labels and gaze lines).
-Use these IDs to identify the individuals specified in the prompt.
-Your task is to analyze specific time segments of a video to detect social gestures.
-Focus on DEICTIC gestures like pointing, showing, giving, and reaching.
-Use the provided bounding box context and timestamps to be precise.
-"""
-
-def setup_caching_strategy(client: 'genai.Client', video_file: any, model_name: str) -> Tuple[Optional[any], int]:
-    """
-    Setup caching, prioritizing usage for Gemini 3 High-Res.
-    Always attempts to cache, adding padding if necessary.
-    Returns: (cache_object, sleep_interval)
-    """
-    MIN_CACHE_TOKENS = 32768
-    
-    try:
-        print("Creating High-Res Video Part for Caching...")
-        # Create High-Res Part to force ~120k tokens
-        video_part = types.Part.from_uri(
-            file_uri=video_file.uri,
-            mime_type=video_file.mime_type,
-            media_resolution="high"
-        )
-        
-        print("Checking token count for caching eligibility...")
-        count_resp = client.models.count_tokens(
-            model=model_name,
-            contents=[video_part, SYSTEM_INSTRUCTION]
-        )
-        total_tokens = count_resp.total_tokens
-        print(f"Total Tokens (High-Res Video + System): {total_tokens}")
-        
-        final_system_instruction = SYSTEM_INSTRUCTION
-        
-        if total_tokens < MIN_CACHE_TOKENS:
-            shortfall = MIN_CACHE_TOKENS - total_tokens + 500 # Generous buffer
-            print(f"Token count {total_tokens} < {MIN_CACHE_TOKENS}. Padding with ~{shortfall} tokens.")
-            # 1 token approx 4 chars.
-            padding = " " * (shortfall * 5) 
-            final_system_instruction += f"\n\n<!-- PADDING TO REACH CACHE LIMIT -->\n{padding}"
-        
-        # Create Cache
-        print("Creating Context Cache...")
-        cache = client.caches.create(
-            model=model_name,
-            config={
-                "contents": [video_part],
-                "system_instruction": final_system_instruction,
-                "ttl": "3600s"
-            }
-        )
-        print(f"Cache created: {cache.name}")
-        return cache, 10
-        
-    except Exception as e:
-        print(f"Failed to setup cache strategy: {e}")
-        # Fallback to standard upload if cache fails seriously
-        return None, 30
-
-
+@retry_with_backoff()
 def upload_video_to_gemini(client: 'genai.Client', video_path: str) -> Optional[any]:
-    """
-    Upload a video file to Gemini for processing using genai.Client.
-    """
-    if not GEMINI_AVAILABLE:
-        return None
-    
+    """Refactored upload using new genai.Client."""
     try:
-        print(f"Uploading video to Gemini: {video_path}...")
-        # Upload the video file (new SDK syntax)
-        # client.files.upload returns a wrapper/object with .name, .state, etc.
+        if not os.path.exists(video_path):
+            print(f"Video not found: {video_path}")
+            return None
+            
+        print(f"Uploading video: {os.path.basename(video_path)}...")
+        
+        # Note: media_resolution is not supported in upload config. Using default.
         video_file = client.files.upload(file=video_path, config={"mime_type": "video/mp4"})
         
-        # Wait for file to be processed
-        import time
-        max_wait = 300  # 5 minutes max wait for full video
+        print(f"Waiting for processing (URI: {video_file.uri})...")
+        
         wait_time = 0
-        print(f"Waiting for video processing (current state: {video_file.state})...")
-        
-        # Note: In new SDK, state is an enum or string. Defensive check.
-        # Usually it's "PROCESSING", "ACTIVE", "FAILED"
-        print(f"Waiting for video processing (current state: {video_file.state})...")
-        
+        max_wait = 300
         while video_file.state == types.FileState.PROCESSING and wait_time < max_wait:
-            time.sleep(5)
+            time.sleep(2)
             wait_time += 5
-            # Refresh file status
-            video_file = client.files.get(name=video_file.name)
+            try:
+                video_file = client.files.get(name=video_file.name)
+            except Exception as e:
+                 if "429" in str(e): raise
+                 pass # Transient get error, continue waiting
+            
             if wait_time % 10 == 0:
                 print(f"  Still processing... ({wait_time}s)")
         
@@ -205,7 +162,9 @@ def upload_video_to_gemini(client: 'genai.Client', video_path: str) -> Optional[
             
         print(f"Video ready: {video_file.name}")
         return video_file
+        
     except Exception as e:
+        if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e): raise
         print(f"Error uploading video: {e}")
         return None
 
@@ -222,17 +181,12 @@ def delete_uploaded_file(client: 'genai.Client', file_obj) -> None:
 
 def build_classification_prompt(event: Dict, gaze_context: Dict) -> str:
     """
-    Build a structured prompt for Gemini using timestamps.
+    Build a structured prompt for Gemini to validate and classify gestures.
     """
     event_type = event.get('event_type', 'unknown')
     persons = event.get('persons_involved', [])
-    start_time = event.get('start_time', 0)
-    end_time = event.get('end_time', 0)
     
-    # Add context window (1s before/after)
-    focus_start = max(0, start_time - 1.0)
-    focus_end = end_time + 1.0
-    
+    # Event type definitions
     event_definitions = {
         "sudden_gaze_shift": "A person suddenly changed where they're looking",
         "joint_attention": "Multiple people looking at the same target",
@@ -242,31 +196,85 @@ def build_classification_prompt(event: Dict, gaze_context: Dict) -> str:
     }
     event_desc = event_definitions.get(event_type, event_type)
     
-    prompt = f"""As a "microscope" for the video, analyze the following segment:
+    prompt = f"""Analyze these video frames to validate a detected social interaction event.
+
+## About These Frames
+- These frames have annotations: Colored bounding boxes (P0, P1, P2...) and gaze direction lines.
+- **Note on Gaze Accuracy**: Gaze lines are approximate. Prioritize logical context over exact line endpoints.
+
+## Event Detected
+- Type: **{event_type}** = {event_desc}
+- Time: {event.get('start_time', 0):.2f}s - {event.get('end_time', 0):.2f}s
+- Persons: {persons}
+
+## Tasks
+1. **Validate**: Do gaze patterns support this {event_type}?
+2. **Detect Gestures**: Report deictic gestures ONLY if CLEARLY VISIBLE with UNAMBIGUOUS INTENT
+3. **Causality**: Did any gesture cause gaze shifts?
+
+## Deictic Gesture Definitions (Be STRICT)
+
+**pointing** - Directing others' attention to a target via extended finger/hand
+  ✓ YES: Extended arm with finger pointing at object/person/location
+  ✗ NOT: Talking with hands, hand gestures during speech, arm resting
+
+**showing** - Presenting an object for others to visually inspect
+  ✓ YES: Holding object UP and orienting it toward another person's view
+  ✗ NOT: Simply holding an object, object on table, object in lap
+
+**giving** - Transferring an object to another person's possession  
+  ✓ YES: Extending hand WITH object toward recipient, offering motion
+  ✗ NOT: Object at rest, just holding something, passing nearby
+
+**reaching** - Extending hand toward an object to acquire/touch it
+  ✓ YES: Arm extending TOWARD object with intent to grab/touch
+  ✗ NOT: Arms relaxed, hands in lap, casual arm movement
+
+## Key Distinctions
+- pointing vs reaching: ATTENTION direction vs ACQUISITION intent
+- showing vs giving: VISUAL inspection vs POSSESSION transfer
+- giving + reaching often occur TOGETHER (one gives, other reaches)
+
+## ANTI-HALLUCINATION RULES
+1. Default to EMPTY array if uncertain
+2. Require CLEAR arm/hand extension for any gesture
+3. Hand movements during speech are NOT pointing
+4. Object must be ACTIVELY manipulated for showing/giving
+5. Report ONLY gestures you are >90% confident about
+
+## Response Format (JSON only)
+
+{{{{
+    "event_confirmed": true | false,
+    "rejection_reason": "<only if rejected>",
     
-    ## Focus Segment
-    **TIMESTAMPS: {focus_start:.2f}s to {focus_end:.2f}s**
-    Strictly focus your analysis on this time window within the full video.
+    "deictic_gestures": [
+        {{{{
+            "gesture_type": "pointing" | "showing" | "giving" | "reaching",
+            "initiator_id": <person ID>,
+            "target_type": "person" | "object" | "location",
+            "target_person_id": <ID if person, else null>,
+            "target_description": "<what/who>"
+        }}}}
+    ],
     
-    ## Event Details
-    - Type: **{event_type}** ({event_desc})
-    - Persons Involved IDs: {persons}
-    - Visuals: Use the P0, P1 bounding box labels and gaze lines to confirm identity.
+    "caused_gaze_shift": true | false,
+    "responder_ids": [<person IDs who shifted gaze>],
     
-    ## Tasks
-    1. **Validate**: Is the `{event_type}` event genuinely happening?
-    2. **Detect Gestures**: Identify any DEICTIC gestures (pointing, showing, giving, reaching) performed by the people involved.
-    3. **Causality**: Did a gesture CAUSE the gaze event?
-    """
+    "description": "<what's happening>"
+}}}}
+
+Return EMPTY array for deictic_gestures if none detected or uncertain. JSON only, no other text.
+"""
     return prompt
 
 
+@retry_with_backoff()
 def classify_with_gemini(
     client: 'genai.Client',
     prompt: str,
     video_file: any,
-    model_name: str = "gemini-3-flash-preview", 
-    cache_name: Optional[str] = None,
+    model_name: str = "models/gemini-2.5-flash", 
 ) -> Tuple[str, Dict]:
     """
     Send prompt with PRE-UPLOADED video to Gemini using genai.Client.
@@ -276,27 +284,18 @@ def classify_with_gemini(
         return "ERROR: Gemini not available", {}
     
     # Configure generation config using types (new SDK)
-    # Configure generation config using types (new SDK)
     config_dict = {
-        "temperature": 0.2,
+        "temperature": 0.0,  # Zero for maximum determinism, reduce hallucinations
         "response_mime_type": "application/json",
         "response_schema": GESTURE_RESPONSE_SCHEMA,
-        "media_resolution": "high",
     }
     
     # Add Thinking Config for Gemini 3
     if "gemini-3" in model_name:
-         # Note: Check if SDK supports ThinkingConfig. If not, pass as dict.
-         # Assuming recent SDK has it or accepts dict in thinking_config
          config_dict["thinking_config"] = {"thinking_level": "medium"}
 
-    # Use Cache if available
-    contents = []
-    if cache_name:
-        config_dict["cached_content"] = cache_name
-        contents = [prompt]
-    else:
-        contents = [video_file, prompt]
+    # Pass video file object directly (SDK handles conversion)
+    contents = [video_file, prompt]
         
     config = types.GenerateContentConfig(**config_dict)
     
@@ -320,6 +319,7 @@ def classify_with_gemini(
         return raw_text, parsed
         
     except Exception as e:
+        if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e): raise
         print(f"Gemini API Error: {e}")
         return f"ERROR: {str(e)}", {}
 
@@ -329,7 +329,7 @@ def classify_events(
     events: List[Dict],
     gaze_data: Dict,
     api_key: Optional[str] = None,
-    model_name: str = "gemini-3-flash-preview",
+    model_name: str = "models/gemini-2.5-flash",
     max_events: Optional[int] = None,
     sample_fps: float = None, 
     viz_video_path: Optional[str] = None,
@@ -375,13 +375,9 @@ def classify_events(
         print("CRITICAL: Failed to upload video. Aborting.")
         return []
     
-    # 2.5 Setup Caching Strategy
-    cache, sleep_interval = setup_caching_strategy(client, video_file, model_name)
-        
     try:
         # 3. Iterate Events
-        mode_str = "Context Caching" if cache else "Standard Upload"
-        print(f"Step 2: Processing {len(events_to_process)} events using {mode_str} (Request Sleep: {sleep_interval}s)...")
+        print(f"Step 2: Processing {len(events_to_process)} events using Standard Upload (Request Sleep: 5s)...")
         
         for i, event in enumerate(events_to_process):
             # Build prompt with timestamps
@@ -393,9 +389,8 @@ def classify_events(
             raw_response, parsed = classify_with_gemini(
                 client=client,
                 prompt=prompt,
-                video_file=video_file if not cache else None,
-                model_name=model_name,
-                cache_name=cache.name if cache else None
+                video_file=video_file,
+                model_name=model_name
             )
             
             if parsed:
@@ -426,20 +421,13 @@ def classify_events(
             results.append(result)
             
             # Rate limit politeness
-            # Dynamic sleep based on caching strategy
+            # Steady sleep
             import time
-            time.sleep(sleep_interval)
+            time.sleep(5)
             
     finally:
         # 4. Cleanup
         print("Cleaning up resources...")
-        if cache:
-             try:
-                 client.caches.delete(name=cache.name)
-                 print(f"Deleted cache: {cache.name}")
-             except Exception as e:
-                 print(f"Error deleting cache: {e}")
-                 
         delete_uploaded_file(client, video_file)
     
     return results
@@ -450,7 +438,15 @@ def save_classifications(
     events_data: Dict,
     output_path: str,
 ) -> None:
-    """Save classification results to JSON."""
+    """Save classification results to JSON with full temporal info.
+    
+    Merges event metadata (timestamps, frames, persons) into each classification
+    so the output is self-contained for Video-LLM training.
+    """
+    # Build event lookup for merging temporal info
+    events_list = events_data.get("events", [])
+    event_lookup = {e.get("event_id"): e for e in events_list}
+    
     # Count validation results and deictic gestures
     confirmed_count = sum(1 for r in results if r.event_confirmed)
     rejected_count = len(results) - confirmed_count
@@ -464,6 +460,8 @@ def save_classifications(
     
     output = {
         "video_path": events_data.get("video_path"),
+        "video_fps": events_data.get("video_fps"),
+        "sample_fps": events_data.get("sample_fps"),
         "num_events_classified": len(results),
         "events_confirmed": confirmed_count,
         "events_rejected": rejected_count,
@@ -471,17 +469,32 @@ def save_classifications(
         "classifications": [],
     }
     
-    # Convert to dicts
+    # Convert to dicts with merged event metadata
     for r in results:
-        output["classifications"].append({
+        # Get original event for temporal info
+        event = event_lookup.get(r.event_id, {})
+        
+        classification_entry = {
+            # Temporal info from events.json (for Video-LLM training)
             "event_id": r.event_id,
+            "event_type": event.get("event_type"),
+            "start_time": event.get("start_time"),
+            "end_time": event.get("end_time"),
+            "start_frame": event.get("start_frame"),
+            "end_frame": event.get("end_frame"),
+            "persons_involved": event.get("persons_involved", []),
+            "event_confidence": event.get("confidence"),
+            "event_details": event.get("details", {}),
+            
+            # Classification results from Gemini
             "event_confirmed": r.event_confirmed,
             "rejection_reason": r.rejection_reason,
             "deictic_gestures": r.deictic_gestures,
             "caused_gaze_shift": r.caused_gaze_shift,
             "responder_ids": r.responder_ids,
             "description": r.description,
-        })
+        }
+        output["classifications"].append(classification_entry)
     
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
     with open(output_path, 'w') as f:
@@ -506,7 +519,7 @@ def process_single_video(
     events_json: str,
     output_path: str,
     api_key: str,
-    model_name: str = "gemini-3-flash-preview",
+    model_name: str = "models/gemini-2.5-flash",
     gaze_json: Optional[str] = None,
     max_events: Optional[int] = None,
 ) -> bool:
@@ -601,6 +614,7 @@ Examples:
     
     # Mode selection
     parser.add_argument("--batch", action="store_true", help="Enable batch processing mode")
+    parser.add_argument("--workers", type=int, default=3, help="Number of concurrent workers (default: 3)")
     
     # Single file mode args
     parser.add_argument("--video_path", type=str, help="Path to video (single mode)")
@@ -615,7 +629,7 @@ Examples:
     # Common args
     parser.add_argument("--output_dir", type=str, default=None, help="Output directory for gesture JSONs")
     parser.add_argument("--api_key", type=str, default=None, help="Gemini API key (or set GOOGLE_API_KEY env)")
-    parser.add_argument("--model", type=str, default="gemini-3-flash-preview", help="Gemini model to use")
+    parser.add_argument("--model", type=str, default="models/gemini-2.5-flash", help="Gemini model to use")
     parser.add_argument("--max_events", type=int, default=500, help="Max events to classify per video (default: 500)")
     parser.add_argument("--skip_existing", action="store_true", help="Skip if output file already exists")
     
@@ -647,32 +661,31 @@ Examples:
         
         print(f"Found {len(event_files)} event files in {args.events_dir}")
         
-        processed = 0
+        # Prepare Batch Tasks
+        batch_tasks = []
         skipped = 0
-        failed = 0
+        
+        print(f"Preparing tasks for {args.workers} workers...")
         
         for event_file in event_files:
             events_json = os.path.join(args.events_dir, event_file)
-            output_filename = get_output_filename(events_json)
+            video_id = os.path.basename(event_file).replace("_gaze_events.json", "").replace("_events.json", "")
+             
+            # 1. Output Path
+            output_filename = get_output_filename(event_file)
             output_path = os.path.join(args.output_dir, output_filename)
-            
-            # Skip if exists
+             
+            # 2. Check Exists
             if args.skip_existing and os.path.exists(output_path):
-                print(f"Skipping (exists): {output_filename}")
                 skipped += 1
                 continue
-            
-            # Find matching video
-            # Pattern: {video_id}_sam3rf_gaze_events.json -> {video_id}_sam3rf_viz.mp4
-            video_id = event_file.replace("_sam3rf_gaze_events.json", "").replace("_gaze_events.json", "").replace("_events.json", "")
-            
-            # Try different video naming patterns
+
+            # 3. Find Video
             video_candidates = [
                 os.path.join(args.videos_dir, f"{video_id}_sam3rf_viz.mp4"),
                 os.path.join(args.videos_dir, f"{video_id}_viz.mp4"),
                 os.path.join(args.videos_dir, f"{video_id}.mp4"),
             ]
-            
             video_path = None
             for candidate in video_candidates:
                 if os.path.exists(candidate):
@@ -680,11 +693,10 @@ Examples:
                     break
             
             if not video_path:
-                print(f"WARNING: No video found for {event_file}, skipping...")
-                failed += 1
+                print(f"Warning: No video for {video_id}")
                 continue
-            
-            # Find matching gaze JSON (optional)
+                
+            # 4. Find Gaze (Optional)
             gaze_json = None
             gaze_candidates = [
                 os.path.join(args.videos_dir, f"{video_id}_sam3rf_gaze.json"),
@@ -695,32 +707,49 @@ Examples:
                     gaze_json = candidate
                     break
             
-            try:
-                success = process_single_video(
-                    video_path=video_path,
-                    events_json=events_json,
-                    output_path=output_path,
-                    api_key=api_key,
-                    model_name=args.model,
-                    gaze_json=gaze_json,
-                    max_events=args.max_events,
-                )
-                if success:
-                    processed += 1
-                else:
-                    failed += 1
-            except Exception as e:
-                print(f"ERROR processing {event_file}: {e}")
-                failed += 1
+            # Add to Queue
+            batch_tasks.append((
+                video_path,
+                events_json,
+                output_path,
+                api_key,
+                args.model,
+                gaze_json,
+                args.max_events
+            ))
+
+        print(f"Queued {len(batch_tasks)} tasks. Skipped {skipped} existing.")
         
+        if not batch_tasks:
+            print("No tasks to run.")
+            return
+
+        print(f"Starting execution with {args.workers} threads...")
+        
+        # Execute Parallel
+        processed_count = 0
+        failed_count = 0
+        
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            # Map returns iterator of results
+            results = list(tqdm(
+                executor.map(lambda args: process_single_video(*args), batch_tasks), 
+                total=len(batch_tasks),
+                desc="Processing Videos",
+                file=sys.stdout
+            ))
+            
+        processed_count = sum(1 for r in results if r)
+        failed_count = sum(1 for r in results if not r)
+
         print(f"\n{'='*60}")
         print(f"Batch Processing Complete")
         print(f"{'='*60}")
-        print(f"  Processed: {processed}")
+        print(f"  Processed: {processed_count}")
         print(f"  Skipped:   {skipped}")
-        print(f"  Failed:    {failed}")
+        print(f"  Failed:    {failed_count}")
         print(f"  Total:     {len(event_files)}")
-    
+
     else:
         # ========== SINGLE FILE MODE ==========
         if not args.video_path or not args.events_json:
@@ -753,7 +782,5 @@ Examples:
             gaze_json=args.gaze_json,
             max_events=args.max_events,
         )
-
-
 if __name__ == "__main__":
     main()

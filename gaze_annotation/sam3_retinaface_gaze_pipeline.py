@@ -866,9 +866,9 @@ class Sam3RetinaFaceGazeAnnotator:
             print(f"Processing faces and gaze at {sample_fps:.1f}fps ({len(frame_indices)} frames)...")
         else:
             print(f"Processing faces and gaze per frame ({len(frame_indices)} frames)...")
-        pbar = tqdm(frame_indices, desc="Estimating gaze", disable=not progress_bar)
+        pbar = tqdm(enumerate(frame_indices), desc="Estimating gaze", disable=not progress_bar, total=len(frame_indices))
         
-        for frame_idx in pbar:
+        for processed_idx, frame_idx in pbar:
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
             ret, frame_bgr = cap.read()
             if not ret:
@@ -885,7 +885,9 @@ class Sam3RetinaFaceGazeAnnotator:
             
             frame_data = {
                 "frame_idx": frame_idx,
-                "timestamp": frame_idx / video_fps if video_fps > 0 else 0,
+                # Use processed frame index / sample_fps for consistent timing
+                # This ensures 0.5s intervals at 2fps regardless of original video fps
+                "timestamp": processed_idx / effective_fps if effective_fps > 0 else 0,
                 "persons": [],
             }
             

@@ -45,7 +45,12 @@ class QAPair:
 
 
 class QADatasetGenerator:
-    """Generate QA pairs from gaze and gesture annotations."""
+    """Generate QA pairs from gaze and gesture annotations.
+    
+    Supports enhanced gestures.json format (v2) with embedded temporal info:
+    - event_type, start_time, end_time, start_frame, end_frame, persons_involved
+    - No need to join with events.json for gesture-related QA
+    """
     
     def __init__(
         self,
@@ -57,16 +62,20 @@ class QADatasetGenerator:
         self.events_data = events_data or {}
         self.gestures_data = gestures_data or {}
         self.video_path = gaze_data.get("video_path", "")
-        self.fps = gaze_data.get("fps", 2.0)
+        self.sample_fps = gaze_data.get("sample_fps", 2.0)
+        self.video_fps = gaze_data.get("video_fps", 30.0)
         
         # Parse frame annotations
-        self.frames = gaze_data.get("frame_annotations", [])
+        self.frames = gaze_data.get("frames", gaze_data.get("frame_annotations", []))
         self.events = events_data.get("events", []) if events_data else []
         self.classifications = gestures_data.get("classifications", []) if gestures_data else []
         
-        # Build event lookup by event_id
+        # Build event lookup by event_id (for fallback if gestures don't have temporal info)
+        self.event_lookup = {e.get("event_id"): e for e in self.events}
+        
+        # Build classification lookup by event_id
         self.classification_lookup = {
-            c["event_id"]: c for c in self.classifications
+            c.get("event_id"): c for c in self.classifications
         }
     
     def generate_all(self) -> List[QAPair]:
@@ -96,8 +105,8 @@ class QADatasetGenerator:
         qa_pairs = []
         
         for i, frame in enumerate(self.frames):
-            frame_idx = frame.get("frame_index", i)
-            time_sec = frame_idx / self.fps
+            frame_idx = frame.get("frame_idx", frame.get("frame_index", i))
+            timestamp = frame.get("timestamp", frame_idx / self.sample_fps)
             persons = frame.get("persons", [])
             
             for person in persons:
@@ -122,11 +131,11 @@ class QADatasetGenerator:
                                     category="A",
                                     subcategory="A2",
                                     task_type="classification",
-                                    question=f"At {time_sec:.1f}s, which direction did P{person_id}'s gaze shift?",
+                                    question=f"At {timestamp:.1f}s, which direction did P{person_id}'s gaze shift?",
                                     answer=direction,
                                     video_path=self.video_path,
-                                    start_time=time_sec - 0.5,
-                                    end_time=time_sec + 0.5,
+                                    start_time=timestamp - 0.5,
+                                    end_time=timestamp + 0.5,
                                     persons_involved=[person_id],
                                 ))
                             
@@ -138,11 +147,11 @@ class QADatasetGenerator:
                                 category="A",
                                 subcategory="A3",
                                 task_type="classification",
-                                question=f"At {time_sec:.1f}s, how much did P{person_id}'s gaze shift?",
+                                question=f"At {timestamp:.1f}s, how much did P{person_id}'s gaze shift?",
                                 answer=magnitude_label,
                                 video_path=self.video_path,
-                                start_time=time_sec - 0.5,
-                                end_time=time_sec + 0.5,
+                                start_time=timestamp - 0.5,
+                                end_time=timestamp + 0.5,
                                 persons_involved=[person_id],
                             ))
         
@@ -196,83 +205,96 @@ class QADatasetGenerator:
     # ========================================================================
     
     def _generate_gesture_gaze_qa(self) -> List[QAPair]:
-        """Generate gesture-gaze cross-reasoning QA pairs."""
+        """Generate gesture-gaze cross-reasoning QA pairs.
+        
+        Uses enhanced classifications format (v2) with embedded temporal info.
+        Falls back to events.json lookup for legacy format.
+        """
         qa_pairs = []
         
         for classification in self.classifications:
             event_id = classification.get("event_id")
             
-            # Find corresponding event
-            event = next((e for e in self.events if e.get("event_id") == event_id), None)
-            if not event:
-                continue
+            # Get temporal info from classification first (enhanced format v2)
+            # Fallback to event lookup for legacy format
+            start_time = classification.get("start_time")
+            end_time = classification.get("end_time")
+            persons_involved = classification.get("persons_involved", [])
             
-            start_time = event.get("start_time", 0)
-            end_time = event.get("end_time", 0)
+            if start_time is None or end_time is None:
+                # Legacy format: need to join with events.json
+                event = self.event_lookup.get(event_id, {})
+                start_time = event.get("start_time", 0)
+                end_time = event.get("end_time", 0)
+                persons_involved = event.get("persons_involved", [])
             
-            # B1: Gaze trigger person (who initiated)
-            initiator_id = classification.get("initiator_id")
-            if initiator_id is not None:
-                qa_pairs.append(QAPair(
-                    question_id=f"B1_{event_id}",
-                    category="B",
-                    subcategory="B1",
-                    task_type="classification",
-                    question=f"Between {start_time:.1f}s and {end_time:.1f}s, who initiated the gesture?",
-                    answer=f"P{initiator_id}",
-                    video_path=self.video_path,
-                    start_time=start_time,
-                    end_time=end_time,
-                    persons_involved=event.get("persons_involved"),
-                ))
-            
-            # B2: Gesture target identification
-            target_type = classification.get("gesture_target_type")
-            if target_type == "person":
-                target_id = classification.get("gesture_target_person_id")
-                if target_id is not None:
+            # B1: Iterate over deictic_gestures for gesture-specific QA
+            deictic_gestures = classification.get("deictic_gestures", [])
+            for gesture in deictic_gestures:
+                gesture_type = gesture.get("gesture_type")
+                initiator_id = gesture.get("initiator_id")
+                target_type = gesture.get("target_type")
+                target_person_id = gesture.get("target_person_id")
+                target_desc = gesture.get("target_description")
+                
+                # B1: Who initiated the gesture?
+                if initiator_id is not None:
                     qa_pairs.append(QAPair(
-                        question_id=f"B2_{event_id}",
+                        question_id=f"B1_{event_id}_{initiator_id}",
                         category="B",
-                        subcategory="B2",
+                        subcategory="B1",
                         task_type="classification",
-                        question=f"Between {start_time:.1f}s and {end_time:.1f}s, who is the target of the gesture?",
-                        answer=f"P{target_id}",
+                        question=f"Between {start_time:.1f}s and {end_time:.1f}s, who initiated the {gesture_type} gesture?",
+                        answer=f"P{initiator_id}",
                         video_path=self.video_path,
                         start_time=start_time,
                         end_time=end_time,
-                        persons_involved=event.get("persons_involved"),
+                        persons_involved=persons_involved,
                     ))
-            elif target_type == "object":
-                target_desc = classification.get("gesture_target_description")
-                if target_desc:
+                
+                # B2: Gesture target identification
+                if target_type == "person" and target_person_id is not None:
                     qa_pairs.append(QAPair(
-                        question_id=f"B2_{event_id}",
+                        question_id=f"B2_{event_id}_{initiator_id}",
                         category="B",
                         subcategory="B2",
                         task_type="classification",
-                        question=f"Between {start_time:.1f}s and {end_time:.1f}s, what is the target of the gesture?",
+                        question=f"Between {start_time:.1f}s and {end_time:.1f}s, who is P{initiator_id}'s {gesture_type} directed at?",
+                        answer=f"P{target_person_id}",
+                        video_path=self.video_path,
+                        start_time=start_time,
+                        end_time=end_time,
+                        persons_involved=persons_involved,
+                    ))
+                elif target_type in ["object", "location"] and target_desc:
+                    qa_pairs.append(QAPair(
+                        question_id=f"B2_{event_id}_{initiator_id}",
+                        category="B",
+                        subcategory="B2",
+                        task_type="classification",
+                        question=f"Between {start_time:.1f}s and {end_time:.1f}s, what is P{initiator_id}'s {gesture_type} directed at?",
                         answer=target_desc,
                         video_path=self.video_path,
                         start_time=start_time,
                         end_time=end_time,
-                        persons_involved=event.get("persons_involved"),
+                        persons_involved=persons_involved,
                     ))
             
             # B3: Gaze-gesture alignment (did gesture cause gaze shift?)
             caused_shift = classification.get("caused_gaze_shift", False)
-            qa_pairs.append(QAPair(
-                question_id=f"B3_{event_id}",
-                category="B",
-                subcategory="B3",
-                task_type="binary",
-                question=f"Between {start_time:.1f}s and {end_time:.1f}s, did the gesture cause others to shift their gaze?",
-                answer="yes" if caused_shift else "no",
-                video_path=self.video_path,
-                start_time=start_time,
-                end_time=end_time,
-                persons_involved=event.get("persons_involved"),
-            ))
+            if deictic_gestures:  # Only ask if there were gestures detected
+                qa_pairs.append(QAPair(
+                    question_id=f"B3_{event_id}",
+                    category="B",
+                    subcategory="B3",
+                    task_type="binary",
+                    question=f"Between {start_time:.1f}s and {end_time:.1f}s, did any gesture cause others to shift their gaze?",
+                    answer="yes" if caused_shift else "no",
+                    video_path=self.video_path,
+                    start_time=start_time,
+                    end_time=end_time,
+                    persons_involved=persons_involved,
+                ))
         
         return qa_pairs
     
@@ -350,52 +372,69 @@ class QADatasetGenerator:
     # ========================================================================
     
     def _generate_object_attention_qa(self) -> List[QAPair]:
-        """Generate object-centric social attention QA pairs."""
+        """Generate object-centric social attention QA pairs.
+        
+        Uses enhanced classifications format (v2) with embedded temporal info.
+        """
         qa_pairs = []
         
         for classification in self.classifications:
             event_id = classification.get("event_id")
             
-            # Find corresponding event
-            event = next((e for e in self.events if e.get("event_id") == event_id), None)
-            if not event:
-                continue
+            # Get temporal info from classification first (enhanced format v2)
+            start_time = classification.get("start_time")
+            end_time = classification.get("end_time")
+            persons_involved = classification.get("persons_involved", [])
             
-            start_time = event.get("start_time", 0)
-            end_time = event.get("end_time", 0)
+            if start_time is None or end_time is None:
+                # Legacy format: need to join with events.json
+                event = self.event_lookup.get(event_id, {})
+                if not event:
+                    continue
+                start_time = event.get("start_time", 0)
+                end_time = event.get("end_time", 0)
+                persons_involved = event.get("persons_involved", [])
             
-            # D1: Object of attention (if gesture target is object)
-            target_type = classification.get("gesture_target_type")
-            if target_type == "object":
-                target_desc = classification.get("gesture_target_description")
-                if target_desc:
-                    qa_pairs.append(QAPair(
-                        question_id=f"D1_{event_id}",
-                        category="D",
-                        subcategory="D1",
-                        task_type="classification",
-                        question=f"Between {start_time:.1f}s and {end_time:.1f}s, what object is the center of attention?",
-                        answer=target_desc,
-                        video_path=self.video_path,
-                        start_time=start_time,
-                        end_time=end_time,
-                        persons_involved=event.get("persons_involved"),
-                    ))
-                    
-                    # D2: Object-driven gaze shift (did object cause gaze shifts?)
-                    caused_shift = classification.get("caused_gaze_shift", False)
-                    qa_pairs.append(QAPair(
-                        question_id=f"D2_{event_id}",
-                        category="D",
-                        subcategory="D2",
-                        task_type="binary",
-                        question=f"Between {start_time:.1f}s and {end_time:.1f}s, did the object cause others to shift their gaze?",
-                        answer="yes" if caused_shift else "no",
-                        video_path=self.video_path,
-                        start_time=start_time,
-                        end_time=end_time,
-                        persons_involved=event.get("persons_involved"),
-                    ))
+            # Iterate over deictic gestures to find object-targeted ones
+            deictic_gestures = classification.get("deictic_gestures", [])
+            for gesture in deictic_gestures:
+                target_type = gesture.get("target_type")
+                if target_type in ["object", "location"]:
+                    target_desc = gesture.get("target_description")
+                    if target_desc:
+                        gesture_type = gesture.get("gesture_type")
+                        initiator_id = gesture.get("initiator_id")
+                        
+                        # D1: Object of attention
+                        qa_pairs.append(QAPair(
+                            question_id=f"D1_{event_id}_{initiator_id}",
+                            category="D",
+                            subcategory="D1",
+                            task_type="classification",
+                            question=f"Between {start_time:.1f}s and {end_time:.1f}s, what {target_type} is P{initiator_id} {gesture_type} at?",
+                            answer=target_desc,
+                            video_path=self.video_path,
+                            start_time=start_time,
+                            end_time=end_time,
+                            persons_involved=persons_involved,
+                        ))
+            
+            # D2: Object-driven gaze shift (if any object-targeted gesture)
+            object_gestures = [g for g in deictic_gestures if g.get("target_type") in ["object", "location"]]
+            if object_gestures:
+                caused_shift = classification.get("caused_gaze_shift", False)
+                qa_pairs.append(QAPair(
+                    question_id=f"D2_{event_id}",
+                    category="D",
+                    subcategory="D2",
+                    task_type="binary",
+                    question=f"Between {start_time:.1f}s and {end_time:.1f}s, did pointing to an object cause others to shift their gaze?",
+                    answer="yes" if caused_shift else "no",
+                    video_path=self.video_path,
+                    start_time=start_time,
+                    end_time=end_time,
+                    persons_involved=persons_involved,
+                ))
         
         return qa_pairs
 
