@@ -37,8 +37,11 @@ class QAPair:
     task_type: str  # "classification", "regression", "binary"
     question: str
     answer: str
+    # Difficulty: "easy" (binary), "medium" (single target), "hard" (multi-person/causal)
+    difficulty: str = "medium"
     # Metadata
     video_path: Optional[str] = None
+    clip_path: Optional[str] = None  # Path to extracted clip (filled during clip extraction)
     start_time: Optional[float] = None
     end_time: Optional[float] = None
     persons_involved: Optional[List[int]] = None
@@ -94,6 +97,60 @@ class QADatasetGenerator:
         # D. Object-centric Social Attention
         qa_pairs.extend(self._generate_object_attention_qa())
         
+        # Negative examples (no gesture detected in confirmed events)
+        qa_pairs.extend(self._generate_negative_qa())
+        
+        return qa_pairs
+    
+    def _generate_negative_qa(self) -> List[QAPair]:
+        """Generate negative QA pairs from confirmed events with no gestures.
+        
+        These are "No" answers to questions like:
+        - "Did anyone point between X and Y?" → "No"
+        - "Was there a giving gesture?" → "No"
+        """
+        qa_pairs = []
+        gesture_types = ["pointing", "showing", "giving", "reaching"]
+        
+        for classification in self.classifications:
+            # Only use confirmed events
+            if not classification.get("event_confirmed", False):
+                continue
+            
+            event_id = classification.get("event_id")
+            
+            # Get temporal info
+            start_time = classification.get("start_time")
+            end_time = classification.get("end_time")
+            persons_involved = classification.get("persons_involved", [])
+            
+            if start_time is None or end_time is None:
+                event = self.event_lookup.get(event_id, {})
+                start_time = event.get("start_time", 0)
+                end_time = event.get("end_time", 0)
+                persons_involved = event.get("persons_involved", [])
+            
+            # Get detected gesture types
+            deictic_gestures = classification.get("deictic_gestures", [])
+            detected_types = set(g.get("gesture_type") for g in deictic_gestures)
+            
+            # Generate negative examples for gesture types NOT detected
+            for g_type in gesture_types:
+                if g_type not in detected_types:
+                    qa_pairs.append(QAPair(
+                        question_id=f"NEG_{event_id}_{g_type}",
+                        category="NEG",
+                        subcategory=f"NEG_{g_type}",
+                        task_type="binary",
+                        question=f"Between {start_time:.1f}s and {end_time:.1f}s, did anyone perform a {g_type} gesture?",
+                        answer="no",
+                        difficulty="easy",  # Binary negative
+                        video_path=self.video_path,
+                        start_time=start_time,
+                        end_time=end_time,
+                        persons_involved=persons_involved,
+                    ))
+        
         return qa_pairs
     
     # ========================================================================
@@ -133,6 +190,7 @@ class QADatasetGenerator:
                                     task_type="classification",
                                     question=f"At {timestamp:.1f}s, which direction did P{person_id}'s gaze shift?",
                                     answer=direction,
+                                    difficulty="easy",  # Single person, simple classification
                                     video_path=self.video_path,
                                     start_time=timestamp - 0.5,
                                     end_time=timestamp + 0.5,
@@ -149,6 +207,7 @@ class QADatasetGenerator:
                                 task_type="classification",
                                 question=f"At {timestamp:.1f}s, how much did P{person_id}'s gaze shift?",
                                 answer=magnitude_label,
+                                difficulty="easy",  # Single person, simple classification
                                 video_path=self.video_path,
                                 start_time=timestamp - 0.5,
                                 end_time=timestamp + 0.5,
@@ -213,6 +272,10 @@ class QADatasetGenerator:
         qa_pairs = []
         
         for classification in self.classifications:
+            # Skip unconfirmed events (hallucinations filtered out)
+            if not classification.get("event_confirmed", False):
+                continue
+            
             event_id = classification.get("event_id")
             
             # Get temporal info from classification first (enhanced format v2)
@@ -246,6 +309,7 @@ class QADatasetGenerator:
                         task_type="classification",
                         question=f"Between {start_time:.1f}s and {end_time:.1f}s, who initiated the {gesture_type} gesture?",
                         answer=f"P{initiator_id}",
+                        difficulty="medium",  # Who-question
                         video_path=self.video_path,
                         start_time=start_time,
                         end_time=end_time,
@@ -261,6 +325,7 @@ class QADatasetGenerator:
                         task_type="classification",
                         question=f"Between {start_time:.1f}s and {end_time:.1f}s, who is P{initiator_id}'s {gesture_type} directed at?",
                         answer=f"P{target_person_id}",
+                        difficulty="medium",  # Who-question
                         video_path=self.video_path,
                         start_time=start_time,
                         end_time=end_time,
@@ -274,6 +339,7 @@ class QADatasetGenerator:
                         task_type="classification",
                         question=f"Between {start_time:.1f}s and {end_time:.1f}s, what is P{initiator_id}'s {gesture_type} directed at?",
                         answer=target_desc,
+                        difficulty="medium",  # What-question
                         video_path=self.video_path,
                         start_time=start_time,
                         end_time=end_time,
@@ -290,6 +356,7 @@ class QADatasetGenerator:
                     task_type="binary",
                     question=f"Between {start_time:.1f}s and {end_time:.1f}s, did any gesture cause others to shift their gaze?",
                     answer="yes" if caused_shift else "no",
+                    difficulty="hard",  # Causality reasoning
                     video_path=self.video_path,
                     start_time=start_time,
                     end_time=end_time,
@@ -308,13 +375,18 @@ class QADatasetGenerator:
         
         for event in self.events:
             event_id = event.get("event_id")
+            
+            # Get classification if available
+            classification = self.classification_lookup.get(event_id, {})
+            
+            # Skip unconfirmed events (only generate QA for validated events)
+            if classification and not classification.get("event_confirmed", False):
+                continue
+            
             event_type = event.get("event_type")
             start_time = event.get("start_time", 0)
             end_time = event.get("end_time", 0)
             persons = event.get("persons_involved", [])
-            
-            # Get classification if available
-            classification = self.classification_lookup.get(event_id, {})
             
             # C1: Who is being looked at (for mutual_gaze, joint_attention)
             if event_type in ["mutual_gaze", "gaze_following"]:
@@ -328,6 +400,7 @@ class QADatasetGenerator:
                         task_type="classification",
                         question=f"Between {start_time:.1f}s and {end_time:.1f}s, who is being looked at?",
                         answer=f"P{target_id}",
+                        difficulty="medium",  # Who-question
                         video_path=self.video_path,
                         start_time=start_time,
                         end_time=end_time,
@@ -344,6 +417,7 @@ class QADatasetGenerator:
                 task_type="binary",
                 question=f"Between {start_time:.1f}s and {end_time:.1f}s, did anyone respond with a gaze shift?",
                 answer="yes" if has_response else "no",
+                difficulty="easy",  # Binary yes/no
                 video_path=self.video_path,
                 start_time=start_time,
                 end_time=end_time,
@@ -359,6 +433,7 @@ class QADatasetGenerator:
                     task_type="classification",
                     question=f"Between {start_time:.1f}s and {end_time:.1f}s, which pair is engaged in mutual gaze?",
                     answer=f"P{persons[0]} and P{persons[1]}",
+                    difficulty="hard",  # Multi-person reasoning
                     video_path=self.video_path,
                     start_time=start_time,
                     end_time=end_time,
@@ -379,6 +454,10 @@ class QADatasetGenerator:
         qa_pairs = []
         
         for classification in self.classifications:
+            # Skip unconfirmed events
+            if not classification.get("event_confirmed", False):
+                continue
+            
             event_id = classification.get("event_id")
             
             # Get temporal info from classification first (enhanced format v2)
@@ -413,6 +492,7 @@ class QADatasetGenerator:
                             task_type="classification",
                             question=f"Between {start_time:.1f}s and {end_time:.1f}s, what {target_type} is P{initiator_id} {gesture_type} at?",
                             answer=target_desc,
+                            difficulty="medium",  # What-question
                             video_path=self.video_path,
                             start_time=start_time,
                             end_time=end_time,
@@ -430,6 +510,7 @@ class QADatasetGenerator:
                     task_type="binary",
                     question=f"Between {start_time:.1f}s and {end_time:.1f}s, did pointing to an object cause others to shift their gaze?",
                     answer="yes" if caused_shift else "no",
+                    difficulty="hard",  # Object-driven causality
                     video_path=self.video_path,
                     start_time=start_time,
                     end_time=end_time,
@@ -439,17 +520,71 @@ class QADatasetGenerator:
         return qa_pairs
 
 
+def balanced_sample(
+    qa_pairs: List[QAPair],
+    max_per_subcategory: int = 100,
+    max_per_difficulty: Optional[int] = None,
+    seed: int = 42
+) -> List[QAPair]:
+    """
+    Balance QA pairs by subcategory and/or difficulty.
+    
+    Args:
+        qa_pairs: Full list of QA pairs
+        max_per_subcategory: Max samples per subcategory (A1, A2, B1, etc.)
+        max_per_difficulty: Optional max per difficulty level within each subcategory
+        seed: Random seed for reproducibility
+    
+    Returns:
+        Balanced subset of QA pairs
+    """
+    random.seed(seed)
+    
+    # Group by subcategory
+    by_subcategory: Dict[str, List[QAPair]] = {}
+    for qa in qa_pairs:
+        key = qa.subcategory
+        if key not in by_subcategory:
+            by_subcategory[key] = []
+        by_subcategory[key].append(qa)
+    
+    sampled = []
+    
+    for subcat, items in by_subcategory.items():
+        random.shuffle(items)
+        
+        if max_per_difficulty:
+            # Further balance by difficulty within subcategory
+            by_diff: Dict[str, List[QAPair]] = {"easy": [], "medium": [], "hard": []}
+            for qa in items:
+                by_diff.get(qa.difficulty, by_diff["medium"]).append(qa)
+            
+            subcat_sample = []
+            for diff in ["easy", "medium", "hard"]:
+                subcat_sample.extend(by_diff[diff][:max_per_difficulty])
+            
+            sampled.extend(subcat_sample[:max_per_subcategory])
+        else:
+            sampled.extend(items[:max_per_subcategory])
+    
+    return sampled
+
+
 def save_qa_dataset(qa_pairs: List[QAPair], output_path: str) -> None:
     """Save QA dataset to JSON."""
-    # Count by category
+    # Count by category and difficulty
     category_counts = {}
+    difficulty_counts = {"easy": 0, "medium": 0, "hard": 0}
+    
     for qa in qa_pairs:
         key = qa.subcategory
         category_counts[key] = category_counts.get(key, 0) + 1
+        difficulty_counts[qa.difficulty] = difficulty_counts.get(qa.difficulty, 0) + 1
     
     output = {
         "num_qa_pairs": len(qa_pairs),
         "category_counts": category_counts,
+        "difficulty_counts": difficulty_counts,
         "qa_pairs": [asdict(qa) for qa in qa_pairs],
     }
     
@@ -461,6 +596,9 @@ def save_qa_dataset(qa_pairs: List[QAPair], output_path: str) -> None:
     print("Category breakdown:")
     for cat, count in sorted(category_counts.items()):
         print(f"  {cat}: {count}")
+    print("Difficulty breakdown:")
+    for diff, count in difficulty_counts.items():
+        print(f"  {diff}: {count}")
 
 
 def main():
@@ -469,6 +607,10 @@ def main():
     parser.add_argument("--events_json", type=str, default=None, help="Path to candidate events JSON")
     parser.add_argument("--gestures_json", type=str, default=None, help="Path to gesture classifications JSON")
     parser.add_argument("--output_json", type=str, default=None, help="Output path for QA dataset")
+    # Sampling options
+    parser.add_argument("--sample", action="store_true", help="Enable balanced sampling")
+    parser.add_argument("--max_per_subcategory", type=int, default=100, help="Max samples per subcategory (default: 100)")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for sampling")
     
     args = parser.parse_args()
     
@@ -496,6 +638,17 @@ def main():
     # Generate QA pairs
     generator = QADatasetGenerator(gaze_data, events_data, gestures_data)
     qa_pairs = generator.generate_all()
+    
+    print(f"Generated {len(qa_pairs)} QA pairs (before sampling)")
+    
+    # Apply balanced sampling if requested
+    if args.sample:
+        qa_pairs = balanced_sample(
+            qa_pairs,
+            max_per_subcategory=args.max_per_subcategory,
+            seed=args.seed
+        )
+        print(f"After balanced sampling: {len(qa_pairs)} QA pairs")
     
     # Save
     save_qa_dataset(qa_pairs, args.output_json)
