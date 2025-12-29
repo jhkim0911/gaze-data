@@ -179,12 +179,40 @@ def delete_uploaded_file(client: 'genai.Client', file_obj) -> None:
             pass
 
 
-def build_classification_prompt(event: Dict, gaze_context: Dict) -> str:
+def build_validation_prompt(event: Dict, persons: str) -> str:
+    """Stage 1: Lightweight prompt for validation only."""
+    event_type = event.get('event_type', 'unknown')
+    event_definitions = {
+        "sudden_gaze_shift": "A person suddenly changed where they're looking",
+        "joint_attention": "Multiple people looking at the same target",
+        "gaze_following": "One person looks where another person is looking",
+        "attention_capture": "One person's action caused others to look at them",
+        "mutual_gaze": "Two people looking at each other",
+    }
+    event_desc = event_definitions.get(event_type, event_type)
+    
+    prompt = f"""Validate this detected social interaction event.
+
+## Event
+- Type: **{event_type}** = {event_desc}
+- Time: {event.get('start_time', 0):.2f}s - {event.get('end_time', 0):.2f}s
+- Persons: {persons}
+
+## Task
+Does the video evidence support this {event_type} event? Answer only with JSON.
+
+{{{{
+    "event_confirmed": true | false
+}}}}
+"""
+    return prompt
+
+
+def build_classification_prompt(event: Dict, persons: str) -> str:
     """
-    Build a structured prompt for Gemini to validate and classify gestures.
+    Build a structured prompt for Gemini to validate event and detect gestures.
     """
     event_type = event.get('event_type', 'unknown')
-    persons = event.get('persons_involved', [])
     
     # Event type definitions
     event_definitions = {
@@ -207,10 +235,8 @@ def build_classification_prompt(event: Dict, gaze_context: Dict) -> str:
 - Time: {event.get('start_time', 0):.2f}s - {event.get('end_time', 0):.2f}s
 - Persons: {persons}
 
-## Tasks
-1. **Validate**: Do gaze patterns support this {event_type}?
-2. **Detect Gestures**: Report deictic gestures ONLY if CLEARLY VISIBLE with UNAMBIGUOUS INTENT
-3. **Causality**: Did any gesture cause gaze shifts?
+## Task
+Detect deictic gestures and analyze gaze causality in this confirmed {event_type} event.
 
 ## Deictic Gesture Definitions (Be STRICT)
 
@@ -245,9 +271,6 @@ def build_classification_prompt(event: Dict, gaze_context: Dict) -> str:
 ## Response Format (JSON only)
 
 {{{{
-    "event_confirmed": true | false,
-    "rejection_reason": "<only if rejected>",
-    
     "deictic_gestures": [
         {{{{
             "gesture_type": "pointing" | "showing" | "giving" | "reaching",
@@ -336,13 +359,11 @@ def classify_events(
 ) -> List[GestureClassification]:
     """
     Classify all candidate events using Single Video Upload + Long Context.
-    Uses genai.Client.
     """
     if not GEMINI_AVAILABLE:
         print("ERROR: google-genai package not installed. Skipping classification.")
         return []
 
-    # Initialize Client (New SDK)
     if not api_key:
          print("ERROR: No API key provided")
          return []
@@ -350,12 +371,33 @@ def classify_events(
     client = genai.Client(api_key=api_key)
     
     results = []
-    events_to_process = events[:max_events] if max_events else events
+    
+    # Filter and limit events
+    MIN_CONFIDENCE = 0.75
+    MAX_EVENTS_TO_PROCESS = 15
+    
+    # First apply max_events limit if set
+    candidate_events = events[:max_events] if max_events else events
+    
+    # Filter by confidence threshold
+    filtered_events = [e for e in candidate_events if e.get("confidence", 1.0) >= MIN_CONFIDENCE]
+    skipped_low_conf = len(candidate_events) - len(filtered_events)
+    if skipped_low_conf > 0:
+        print(f"Filtered out {skipped_low_conf} events with confidence < {MIN_CONFIDENCE}")
+    
+    # Sort by confidence descending and take top N
+    sorted_events = sorted(filtered_events, key=lambda e: e.get("confidence", 0), reverse=True)
+    if len(sorted_events) > MAX_EVENTS_TO_PROCESS:
+        print(f"Clamping from {len(sorted_events)} to top {MAX_EVENTS_TO_PROCESS} events by confidence")
+        events_to_process = sorted_events[:MAX_EVENTS_TO_PROCESS]
+    else:
+        events_to_process = sorted_events
+    
+    print(f"Processing {len(events_to_process)} events (from {len(events)} total)")
     
     # 1. Determine which video to use
     if viz_video_path is None:
         base_name = os.path.splitext(video_path)[0]
-        # Check standard visualization paths
         for suffix in ['_viz.mp4', '_sam3rf_viz.mp4']:
             candidate = base_name + suffix
             if os.path.exists(candidate):
@@ -363,7 +405,6 @@ def classify_events(
                 print(f"Using visualization video: {viz_video_path}")
                 break
     
-    # Validation
     source_video = viz_video_path if viz_video_path and os.path.exists(viz_video_path) else video_path
     if source_video == video_path:
         print(f"Using raw video (no visualization found): {video_path}")
@@ -375,15 +416,19 @@ def classify_events(
         print("CRITICAL: Failed to upload video. Aborting.")
         return []
     
+    import time
+    
     try:
-        # 3. Iterate Events
-        print(f"Step 2: Processing {len(events_to_process)} events using Standard Upload (Request Sleep: 5s)...")
+        # =================== STAGE 1: VALIDATION ===================
+        print(f"Stage 1: Validating {len(events_to_process)} events...")
+        
+        validation_results = {}
         
         for i, event in enumerate(events_to_process):
-            # Build prompt with timestamps
-            prompt = build_classification_prompt(event, gaze_data)
+            event_id = event.get("event_id", i)
+            persons = ", ".join([f"P{p}" for p in event.get("persons_involved", [])])
+            prompt = build_validation_prompt(event, persons)
             
-            # Query Gemini
             print(f"  [{i+1}/{len(events_to_process)}] {event.get('event_type')} @ {event.get('start_time'):.1f}s")
             
             raw_response, parsed = classify_with_gemini(
@@ -393,40 +438,59 @@ def classify_events(
                 model_name=model_name
             )
             
-            if parsed:
-                # Create result object with validated data
-                result = GestureClassification(
-                    event_id=event.get("event_id", i),
-                    event_confirmed=parsed.get("event_confirmed", False),
-                    rejection_reason=parsed.get("rejection_reason"),
-                    deictic_gestures=parsed.get("deictic_gestures", []),
-                    caused_gaze_shift=parsed.get("caused_gaze_shift", False),
-                    responder_ids=parsed.get("responder_ids", []),
-                    description=parsed.get("description", ""),
-                    raw_response=raw_response,
-                )
-            else:
-                # Handle failure
-                result = GestureClassification(
-                    event_id=event.get("event_id", i),
-                    event_confirmed=False,
-                    rejection_reason="Failed to parse Gemini response or API error",
-                    deictic_gestures=[],
-                    caused_gaze_shift=False,
-                    responder_ids=[],
-                    description="",
-                    raw_response=raw_response,
-                )
+            confirmed = parsed.get("event_confirmed", False) if parsed else False
+            validation_results[event_id] = {"confirmed": confirmed, "raw_response": raw_response}
+            time.sleep(3)
+        
+        confirmed_count = sum(1 for v in validation_results.values() if v["confirmed"])
+        print(f"\nStage 1 Complete: {confirmed_count}/{len(events_to_process)} confirmed")
+        
+        # =================== STAGE 2: FULL CLASSIFICATION ===================
+        classification_results = {}
+        
+        if confirmed_count > 0:
+            print(f"\nStage 2: Classifying {confirmed_count} confirmed events...")
             
+            confirmed_events = [e for e in events_to_process 
+                               if validation_results.get(e.get("event_id", -1), {}).get("confirmed")]
+            
+            for i, event in enumerate(confirmed_events):
+                event_id = event.get("event_id", i)
+                persons = ", ".join([f"P{p}" for p in event.get("persons_involved", [])])
+                prompt = build_classification_prompt(event, persons)
+                
+                print(f"  [{i+1}/{len(confirmed_events)}] {event.get('event_type')} @ {event.get('start_time'):.1f}s")
+                
+                raw_response, parsed = classify_with_gemini(
+                    client=client,
+                    prompt=prompt,
+                    video_file=video_file,
+                    model_name=model_name
+                )
+                
+                if parsed:
+                    classification_results[event_id] = parsed
+                time.sleep(5)
+        
+        # =================== MERGE RESULTS ===================
+        for i, event in enumerate(events_to_process):
+            event_id = event.get("event_id", i)
+            val = validation_results.get(event_id, {})
+            cls = classification_results.get(event_id, {})
+            
+            result = GestureClassification(
+                event_id=event_id,
+                event_confirmed=val.get("confirmed", False),
+                rejection_reason=None,
+                deictic_gestures=cls.get("deictic_gestures", []),
+                caused_gaze_shift=cls.get("caused_gaze_shift", False),
+                responder_ids=cls.get("responder_ids", []),
+                description=cls.get("description", ""),
+                raw_response=val.get("raw_response", ""),
+            )
             results.append(result)
             
-            # Rate limit politeness
-            # Steady sleep
-            import time
-            time.sleep(5)
-            
     finally:
-        # 4. Cleanup
         print("Cleaning up resources...")
         delete_uploaded_file(client, video_file)
     
@@ -715,7 +779,7 @@ Examples:
                 api_key,
                 args.model,
                 gaze_json,
-                args.max_events
+                args.max_events,
             ))
 
         print(f"Queued {len(batch_tasks)} tasks. Skipped {skipped} existing.")

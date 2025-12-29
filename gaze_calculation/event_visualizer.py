@@ -115,14 +115,18 @@ def draw_event_overlay(
         line_text = f"{label} {persons_text}"
         
         # Determine text color based on Gemini validation status
-        # Blue = confirmed, Red = rejected, White = no classification
-        text_color = (255, 255, 255)  # Default white
-        if classifications and event_id in classifications:
-            cls = classifications[event_id]
-            if cls.get("event_confirmed"):
-                text_color = (255, 0, 0)    # Blue - confirmed
+        # Blue = confirmed, Red = rejected, Gray = filtered (no classification)
+        if classifications:
+            if event_id in classifications:
+                cls = classifications[event_id]
+                if cls.get("event_confirmed"):
+                    text_color = (255, 0, 0)    # Blue - confirmed
+                else:
+                    text_color = (0, 0, 255)    # Red - rejected
             else:
-                text_color = (0, 0, 255)    # Red - rejected
+                text_color = (128, 128, 128)    # Gray - filtered (not sent to Gemini)
+        else:
+            text_color = (255, 255, 255)        # White - no gestures data loaded
         
         # Colored indicator circle (event type color)
         cv2.circle(frame, (box_x + 10, y_pos - 4), 6, color, -1)
