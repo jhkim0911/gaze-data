@@ -79,9 +79,11 @@ def parse_segment_name(filename: str) -> Tuple[str, int]:
     """
     Parse segment filename to get video_id and segment number.
     
-    Example: "152_1_001_gestures.json" -> ("152_1", 1)
+    Examples:
+        "152_1_001_gestures.json" -> ("152_1", 1)
+        "152_1_001_sam3rf_viz_gestures_v2.json" -> ("152_1", 1)
     """
-    # Match pattern: {video_id}_{segment_num}_*.json
+    # Match pattern: {video_id}_{segment_num}_*.json (handles both v1 and v2)
     match = re.match(r'^(.+?)_(\d{3})(?:_.*)?\.json$', filename)
     if match:
         video_id = match.group(1)
@@ -190,8 +192,10 @@ def load_gemini_gestures(gesture_dir: str, video_id: str) -> List[GestureInstanc
     """
     Load and merge Gemini gesture predictions from all segments of a video.
     
+    Supports both v1 (classifications) and v2 (gestures array) formats.
+    
     Args:
-        gesture_dir: Directory containing *_gestures.json files
+        gesture_dir: Directory containing *_gestures.json or *_gestures_v2.json files
         video_id: Video ID (e.g., "152_1")
     
     Returns:
@@ -199,10 +203,10 @@ def load_gemini_gestures(gesture_dir: str, video_id: str) -> List[GestureInstanc
     """
     gestures = []
     
-    # Find all segment files for this video
+    # Find all segment files for this video (both v1 and v2)
     segment_files = []
     for fname in os.listdir(gesture_dir):
-        if not fname.endswith('_gestures.json'):
+        if not (fname.endswith('_gestures.json') or fname.endswith('_gestures_v2.json')):
             continue
         seg_video_id, seg_num = parse_segment_name(fname)
         if seg_video_id == video_id:
@@ -217,20 +221,23 @@ def load_gemini_gestures(gesture_dir: str, video_id: str) -> List[GestureInstanc
         
         offset = get_segment_offset(seg_num)
         
-        for cls in data.get('classifications', []):
-            deictic_gestures = cls.get('deictic_gestures', [])
-            if not deictic_gestures:
-                continue
-            
-            # Event time range (in segment-local time)
-            event_start = cls.get('start_time', 0)
-            event_end = cls.get('end_time', 0)
-            
-            # Convert to global time
-            global_start = offset + event_start
-            global_end = offset + event_end
-            
-            for g in deictic_gestures:
+        # Check if v2 format (has 'gestures' array directly)
+        if data.get('classifier_version') == 'v2' or 'gestures' in data:
+            # V2 format: gestures are directly in 'gestures' array with start/end frames
+            sample_fps = 2.0  # Video is sampled at 2fps
+            for g in data.get('gestures', []):
+                # Support both old (start_time) and new (start_frame) format
+                if 'start_frame' in g:
+                    gesture_start = g.get('start_frame', 0) / sample_fps
+                    gesture_end = g.get('end_frame', 0) / sample_fps
+                else:
+                    gesture_start = g.get('start_time', 0)
+                    gesture_end = g.get('end_time', 0)
+                
+                # Convert to global time
+                global_start = offset + gesture_start
+                global_end = offset + gesture_end
+                
                 gesture = GestureInstance(
                     gesture_type=g.get('gesture_type', 'unknown'),
                     person_id=g.get('initiator_id', -1),
@@ -242,6 +249,33 @@ def load_gemini_gestures(gesture_dir: str, video_id: str) -> List[GestureInstanc
                     source="gemini"
                 )
                 gestures.append(gesture)
+        else:
+            # V1 format: gestures are nested in 'classifications' -> 'deictic_gestures'
+            for cls in data.get('classifications', []):
+                deictic_gestures = cls.get('deictic_gestures', [])
+                if not deictic_gestures:
+                    continue
+                
+                # Event time range (in segment-local time)
+                event_start = cls.get('start_time', 0)
+                event_end = cls.get('end_time', 0)
+                
+                # Convert to global time
+                global_start = offset + event_start
+                global_end = offset + event_end
+                
+                for g in deictic_gestures:
+                    gesture = GestureInstance(
+                        gesture_type=g.get('gesture_type', 'unknown'),
+                        person_id=g.get('initiator_id', -1),
+                        start_frame=time_to_gt_frame(global_start),
+                        end_frame=time_to_gt_frame(global_end),
+                        start_time=global_start,
+                        end_time=global_end,
+                        target_person_ids=[g['target_person_id']] if g.get('target_person_id') is not None else [],
+                        source="gemini"
+                    )
+                    gestures.append(gesture)
     
     return gestures
 
@@ -405,7 +439,7 @@ def main():
                         default='/projects/illinois/eng/cs/jrehg/users/arkimjh/gaze_social/social_gesture/gesture_data',
                         help='Directory containing Gemini gesture predictions')
     parser.add_argument('--video_id', type=str, default=None,
-                        help='Specific video ID to evaluate (e.g., "152_1"). If not provided, evaluates all.')
+                        help='Video ID(s) to evaluate, comma-separated (e.g., "152_1,152_2"). If not provided, evaluates all.')
     parser.add_argument('--tolerance', type=float, default=2.0,
                         help='Time tolerance for matching in seconds')
     parser.add_argument('--verbose', action='store_true',
@@ -415,7 +449,8 @@ def main():
     
     # Find videos to evaluate
     if args.video_id:
-        video_ids = [args.video_id]
+        # Support comma-separated video IDs
+        video_ids = [v.strip() for v in args.video_id.split(',')]
     else:
         # Find all videos with both GT and predictions
         gt_videos = set()

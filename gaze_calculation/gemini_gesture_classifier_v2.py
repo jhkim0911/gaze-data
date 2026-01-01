@@ -173,7 +173,7 @@ def build_full_video_gesture_prompt(video_duration: float) -> str:
 - The video has annotations: Colored bounding boxes (P0, P1, P2...) and gaze direction lines.
 - Scan the ENTIRE video from start to end.
 
-## Deictic Gesture Types (Be STRICT)
+## Deictic Gesture Types
 
 **pointing** - Extended arm with finger pointing at a target
   ✓ YES: Clear arm extension with finger/hand pointing at object/person/location
@@ -192,10 +192,13 @@ def build_full_video_gesture_prompt(video_duration: float) -> str:
   ✗ NOT: Arms relaxed, casual arm movement
 
 ## Rules
-1. Report ONLY clearly visible gestures (>80% confidence)
+1. Be Comprehensive (Don't miss subtle movements), Confidence threshold: >0.5
 2. Each gesture should have start_time and end_time in seconds
 3. Person IDs match the annotations (P0, P1, P2...)
 4. Return EMPTY array if no clear gestures are visible
+5. (CRITICAL) All timestamps MUST be between 0.0 and {video_duration:.1f} seconds.
+6. If a gesture seems to occur after {video_duration:.1f}s, it is a calculation error; map it to the correct relative time within the bounds.
+7. The video is sampled at 2 FPS (1 frame every 0.5 seconds). Use this to calculate precise timing.
 
 ## Response Format (JSON only)
 
@@ -227,7 +230,7 @@ def classify_with_gemini(client, prompt: str, video_file, model_name: str) -> Tu
     
     config = types.GenerateContentConfig(
         response_mime_type="application/json",
-        temperature=0.2,
+        temperature=0.4,
     )
     
     try:

@@ -147,43 +147,57 @@ def draw_gesture_overlay(
     frame: np.ndarray,
     events: List[Dict],
     classifications: Optional[Dict] = None,
+    video_gestures: Optional[List[Dict]] = None,
+    time_sec: float = 0,
 ) -> np.ndarray:
     """Draw gesture information overlay at bottom-left.
     
     Shows deictic_gestures and responder_ids for active events.
+    For v2: shows gestures from video_gestures that are active at current time.
     Stacks upward when multiple gestures exist.
     """
-    if not classifications:
-        return frame
-    
     h, w = frame.shape[:2]
     
-    # Collect all gestures from active events
+    # Collect all gestures to display
     all_gestures = []
-    for event in events:
-        event_id = event.get("event_id")
-        if event_id in classifications:
-            cls = classifications[event_id]
-            deictic = cls.get("deictic_gestures", [])
-            responder_ids = cls.get("responder_ids", [])
-            
-            for gesture in deictic:
+    
+    # V2: Check video_gestures by frame index
+    # Convert time_sec to frame index (sample_fps = 2.0)
+    current_frame = int(time_sec * 2)
+    if video_gestures:
+        for g in video_gestures:
+            # Support both old (start_time) and new (start_frame) format
+            g_start = g.get("start_frame", g.get("start_time", 0))
+            g_end = g.get("end_frame", g.get("end_time", 0))
+            if g_start <= current_frame <= g_end:
                 all_gestures.append({
-                    "gesture_type": gesture.get("gesture_type", "unknown"),
-                    "initiator_id": gesture.get("initiator_id"),
-                    "target_type": gesture.get("target_type"),
-                    "target_description": gesture.get("target_description"),
-                    "responder_ids": responder_ids,
+                    "gesture_type": g.get("gesture_type", "unknown"),
+                    "initiator_id": g.get("initiator_id"),
+                    "target_type": g.get("target_type"),
+                    "target_description": g.get("target_description"),
+                    "target_person_id": g.get("target_person_id"),
+                    "confidence": g.get("confidence", 1.0),
+                    "responder_ids": [],
                 })
     
-    # If no gestures found but events are active, show null
-    if not all_gestures and events:
-        # Check if any active event has classification
-        has_classification = any(
-            event.get("event_id") in classifications for event in events
-        )
-        if has_classification:
-            all_gestures = [None]  # Placeholder for "null" display
+    # V1: Check classifications for active events
+    if classifications and not video_gestures:
+        for event in events:
+            event_id = event.get("event_id")
+            if event_id in classifications:
+                cls = classifications[event_id]
+                deictic = cls.get("deictic_gestures", [])
+                responder_ids = cls.get("responder_ids", [])
+                
+                for gesture in deictic:
+                    all_gestures.append({
+                        "gesture_type": gesture.get("gesture_type", "unknown"),
+                        "initiator_id": gesture.get("initiator_id"),
+                        "target_type": gesture.get("target_type"),
+                        "target_description": gesture.get("target_description"),
+                        "target_person_id": gesture.get("target_person_id"),
+                        "responder_ids": responder_ids,
+                    })
     
     if not all_gestures:
         return frame
@@ -286,15 +300,28 @@ def visualize_events(
     
     # Load Gemini classifications if available
     classifications = {}
+    video_gestures = []  # For v2: gestures with timestamps
     sample_fps = None
     if gestures_json_path and os.path.exists(gestures_json_path):
         with open(gestures_json_path, 'r') as f:
             gestures_data = json.load(f)
-        for cls in gestures_data.get("classifications", []):
-            classifications[cls["event_id"]] = cls
+        
+        # Check if v2 format
+        if gestures_data.get("classifier_version") == "v2" or "gestures" in gestures_data:
+            # V2 format: gestures are in 'gestures' array with start_time/end_time
+            video_gestures = gestures_data.get("gestures", [])
+            # Also load event validations for event confirmation display
+            for val in gestures_data.get("event_validations", []):
+                classifications[val["event_id"]] = {"event_confirmed": val.get("event_confirmed", False)}
+            print(f"Loaded {len(video_gestures)} gestures (v2) + {len(classifications)} event validations from: {gestures_json_path}")
+        else:
+            # V1 format: gestures nested in 'classifications' -> 'deictic_gestures'
+            for cls in gestures_data.get("classifications", []):
+                classifications[cls["event_id"]] = cls
+            print(f"Loaded {len(classifications)} Gemini classifications (v1) from: {gestures_json_path}")
+        
         # Get sample_fps from gesture data for accurate timing
         sample_fps = gestures_data.get("sample_fps")
-        print(f"Loaded {len(classifications)} Gemini classifications from: {gestures_json_path}")
     
     # Open video
     cap = cv2.VideoCapture(viz_video_path)
@@ -332,8 +359,8 @@ def visualize_events(
         # Draw overlay (with Gemini classifications if available)
         frame = draw_event_overlay(frame, active_events, time_sec, frame_idx, classifications)
         
-        # Draw gesture overlay at bottom-left (only during event duration)
-        frame = draw_gesture_overlay(frame, active_events, classifications)
+        # Draw gesture overlay at bottom-left
+        frame = draw_gesture_overlay(frame, active_events, classifications, video_gestures, time_sec)
         
         out.write(frame)
         frame_idx += 1
@@ -423,13 +450,24 @@ def batch_visualize(
         gestures_path = None
         if gestures_dir:
             # Strip _sam3rf_viz.mp4 first, then _viz.mp4 to get base name
-            gestures_base = base_name.replace("_sam3rf_viz.mp4", "_gestures.json")
-            if gestures_base == base_name:  # Didn't match, try other pattern
-                gestures_base = base_name.replace("_viz.mp4", "_gestures.json")
-            gestures_candidate = os.path.join(gestures_dir, gestures_base)
-            if os.path.exists(gestures_candidate):
-                gestures_path = gestures_candidate
-            else:
+            base_for_gestures = base_name.replace("_sam3rf_viz.mp4", "")
+            if base_for_gestures == base_name:
+                base_for_gestures = base_name.replace("_viz.mp4", "")
+            
+            # Check for both v1 and v2 gesture files
+            gesture_candidates = [
+                os.path.join(gestures_dir, f"{base_for_gestures}_gestures.json"),
+                os.path.join(gestures_dir, f"{base_for_gestures}_gestures_v2.json"),
+                os.path.join(gestures_dir, f"{base_for_gestures}_sam3rf_viz_gestures_v2.json"),
+                os.path.join(gestures_dir, f"{base_name.replace('.mp4', '')}_gestures_v2.json"),
+            ]
+            
+            for candidate in gesture_candidates:
+                if os.path.exists(candidate):
+                    gestures_path = candidate
+                    break
+            
+            if not gestures_path:
                 # When gestures_dir is provided, skip videos without gesture data
                 print(f"Skipping {base_name}: no gestures JSON found (gesture mode)")
                 continue
