@@ -51,6 +51,8 @@ def main():
     video_paths += sorted(glob.glob(os.path.join(args.input_dir, "**/*.avi"), recursive=True))
     video_paths += sorted(glob.glob(os.path.join(args.input_dir, "*.mov")))
     video_paths += sorted(glob.glob(os.path.join(args.input_dir, "**/*.mov"), recursive=True))
+    video_paths += sorted(glob.glob(os.path.join(args.input_dir, "*.mkv")))
+    video_paths += sorted(glob.glob(os.path.join(args.input_dir, "**/*.mkv"), recursive=True))
     # Remove duplicates while preserving order
     video_paths = list(dict.fromkeys(video_paths))
     
