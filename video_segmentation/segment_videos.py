@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 class SegmentConfig:
     """Configuration for video segmentation."""
     min_segment_seconds: int = 45  # Minimum segment length in seconds
-    max_segment_seconds: int = 60  # Maximum segment length in seconds (1 minutes)
+    max_segment_seconds: int = 120  # Maximum segment length in seconds (2 minutes)
     adaptive_threshold: float = 3.0  # AdaptiveDetector threshold
     min_content_val: float = 15.0  # Minimum content difference to detect a scene
 

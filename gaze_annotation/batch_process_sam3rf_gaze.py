@@ -90,7 +90,14 @@ def main():
     errors = 0
     
     for idx, video_path in enumerate(video_paths):
-        video_name = os.path.splitext(os.path.basename(video_path))[0]
+        # Encode relative directory path in filename to avoid collisions in flat output dir
+        # e.g., input_dir/bbt/season_1/episode_1.mp4 -> output_dir/bbt_season_1_episode_1_sam3rf_gaze.json
+        rel_path = os.path.relpath(video_path, args.input_dir)
+        video_name = os.path.splitext(rel_path)[0]  # Keep full path without extension
+        
+        # Replace directory separators with underscores for flat structure
+        video_name = video_name.replace(os.sep, '_')
+        
         output_json = os.path.join(args.output_dir, f"{video_name}_sam3rf_gaze.json")
         output_video = os.path.join(args.output_dir, f"{video_name}_sam3rf_viz.mp4")
         
