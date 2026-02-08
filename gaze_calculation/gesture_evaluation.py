@@ -21,15 +21,51 @@ Generated Data:
 import json
 import os
 import re
+import subprocess
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple, Set
 from pathlib import Path
 
 
-SEGMENT_DURATION_SEC = 120.0  # Each segment is 120 seconds
+SEGMENT_DURATION_SEC = 120.0  # Default segment duration (fallback)
 GT_FPS = 2.0  # Ground truth annotation fps (2fps aligned)
 GEMINI_SAMPLE_FPS = 2.0  # Generated data is also at 2fps
+VIDEO_DIR = '/projects/illinois/eng/cs/jrehg/users/arkimjh/gaze_social/social_gesture/bbox_videos'
+
+# In-memory cache for video durations (persists during run)
+_duration_cache = {}
+
+
+def get_video_duration(video_path: str) -> float:
+    """
+    Get actual video duration using ffprobe (with in-memory caching).
+    
+    Args:
+        video_path: Path to video file
+    
+    Returns:
+        Duration in seconds, or 0.0 if failed
+    """
+    # Check cache first
+    if video_path in _duration_cache:
+        return _duration_cache[video_path]
+    
+    try:
+        result = subprocess.run(
+            ['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration',
+             '-of', 'default=noprint_wrappers=1:nokey=1', video_path],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            duration = float(result.stdout.strip())
+            _duration_cache[video_path] = duration
+            return duration
+    except (subprocess.TimeoutExpired, ValueError, FileNotFoundError):
+        pass
+    
+    _duration_cache[video_path] = 0.0
+    return 0.0
 
 
 @dataclass
@@ -109,6 +145,61 @@ def get_segment_offset(segment_num: int, segment_duration: float = SEGMENT_DURAT
     return (segment_num - 1) * segment_duration
 
 
+# Time windows for per-window analysis (segment-local times in seconds)
+TIME_WINDOWS = [
+    (0, 40, "0-40s"),
+    (40, 80, "40-80s"),
+    (80, 120, "80-120s"),
+]
+
+
+def get_gesture_segment_local_time(gesture: 'GestureInstance', segment_offsets: Dict[int, float]) -> Tuple[int, float]:
+    """
+    Get the segment number and segment-local time for a gesture.
+    
+    Args:
+        gesture: A gesture instance with global time
+        segment_offsets: Dict mapping segment_num -> cumulative offset
+    
+    Returns:
+        Tuple of (segment_num, local_start_time within segment)
+    """
+    # Find which segment this gesture belongs to
+    sorted_segs = sorted(segment_offsets.items(), key=lambda x: x[1], reverse=True)
+    for seg_num, offset in sorted_segs:
+        if gesture.start_time >= offset:
+            local_time = gesture.start_time - offset
+            return seg_num, local_time
+    return 1, gesture.start_time
+
+
+def filter_gestures_by_window(gestures: List['GestureInstance'], 
+                               window_start: float, window_end: float,
+                               segment_offsets: Dict[int, float] = None) -> List['GestureInstance']:
+    """
+    Filter gestures to those whose start_time falls within a segment-local time window.
+    
+    Args:
+        gestures: List of gesture instances
+        window_start: Start of time window (segment-local seconds)
+        window_end: End of time window (segment-local seconds)
+        segment_offsets: Dict mapping segment_num -> cumulative offset (for segment-local filtering)
+    
+    Returns:
+        Filtered list of gestures
+    """
+    if segment_offsets is None:
+        # Simple filtering by absolute time (for single-segment case)
+        return [g for g in gestures if window_start <= g.start_time < window_end]
+    
+    filtered = []
+    for g in gestures:
+        seg_num, local_time = get_gesture_segment_local_time(g, segment_offsets)
+        if window_start <= local_time < window_end:
+            filtered.append(g)
+    return filtered
+
+
 def has_temporal_overlap(g1: GestureInstance, g2: GestureInstance) -> bool:
     """
     Check if two gestures have any temporal overlap.
@@ -157,16 +248,19 @@ def load_gt_annotations_event_format(gt_path: str) -> List[GestureInstance]:
     return gestures
 
 
-def load_generated_gestures(gesture_dir: str, video_id: str) -> List[GestureInstance]:
+def load_generated_gestures(gesture_dir: str, video_id: str, 
+                             return_offsets: bool = False) -> List[GestureInstance]:
     """
     Load and merge generated gesture predictions from all segments of a video.
     
     Args:
         gesture_dir: Directory containing *_gestures_v2.json files
         video_id: Video ID (e.g., "152_1")
+        return_offsets: If True, also return segment offset dict for window analysis
     
     Returns:
         List of GestureInstance with times adjusted to full video timeline
+        (or tuple of (gestures, offsets) if return_offsets=True)
     """
     gestures = []
     
@@ -181,17 +275,40 @@ def load_generated_gestures(gesture_dir: str, video_id: str) -> List[GestureInst
     
     segment_files.sort(key=lambda x: x[0])
     
+    # Build cumulative offsets from actual video durations
+    segment_durations = {}
+    if os.path.isdir(VIDEO_DIR):
+        for seg_num, fname in segment_files:
+            # Match video file (e.g., 152_1_001_bbox_viz.mp4)
+            video_pattern = f"{video_id}_{seg_num:03d}_bbox_viz.mp4"
+            video_path = os.path.join(VIDEO_DIR, video_pattern)
+            if os.path.exists(video_path):
+                duration = get_video_duration(video_path)
+                if duration > 0:
+                    segment_durations[seg_num] = duration
+    
+    # Calculate cumulative offsets
+    cumulative_offsets = {}
+    cumulative = 0.0
+    for seg_num, fname in segment_files:
+        cumulative_offsets[seg_num] = cumulative
+        # Use actual duration if available, otherwise fallback to default
+        duration = segment_durations.get(seg_num, SEGMENT_DURATION_SEC)
+        cumulative += duration
+    
     for seg_num, fname in segment_files:
         fpath = os.path.join(gesture_dir, fname)
         with open(fpath, 'r') as f:
             data = json.load(f)
         
-        offset = get_segment_offset(seg_num)
+        # Use cumulative offset based on actual video durations
+        offset = cumulative_offsets.get(seg_num, get_segment_offset(seg_num))
         
         for g in data.get('gestures', []):
             # Get times (already in seconds at 2fps)
-            gesture_start = g.get('start_time', 0)
-            gesture_end = g.get('end_time', 0)
+            # Convert to float in case they're stored as strings
+            gesture_start = float(g.get('start_time', 0))
+            gesture_end = float(g.get('end_time', 0))
             
             # Apply segment time offset
             global_start = offset + gesture_start
@@ -210,6 +327,8 @@ def load_generated_gestures(gesture_dir: str, video_id: str) -> List[GestureInst
             )
             gestures.append(gesture)
     
+    if return_offsets:
+        return gestures, cumulative_offsets
     return gestures
 
 
@@ -274,7 +393,71 @@ def match_gestures_overlap(gt_gestures: List[GestureInstance],
     return results
 
 
-def evaluate_video(gt_path: str, gesture_dir: str, video_id: str) -> Tuple[Dict[str, EvaluationResult], 
+def compute_confusion_matrix(gt_gestures: List[GestureInstance], 
+                              pred_gestures: List[GestureInstance],
+                              gesture_types: List[str] = None) -> Dict[str, Dict[str, int]]:
+    """
+    Compute confusion matrix for gesture type classification.
+    
+    For each GT gesture, find the best overlapping prediction (any type)
+    and record the GT type vs predicted type.
+    
+    Args:
+        gt_gestures: Ground truth gesture instances
+        pred_gestures: Predicted gesture instances
+        gesture_types: List of gesture types to include
+    
+    Returns:
+        Nested dict: confusion_matrix[gt_type][pred_type] = count
+    """
+    if gesture_types is None:
+        gesture_types = ['pointing', 'showing', 'giving', 'reaching']
+    
+    # Initialize confusion matrix
+    confusion = {gt: {pred: 0 for pred in gesture_types} for gt in gesture_types}
+    confusion['missed'] = 0  # GT with no matching prediction
+    confusion['false_alarm'] = {pred: 0 for pred in gesture_types}  # Predictions with no GT
+    
+    # Track matched predictions
+    matched_preds = set()
+    
+    # For each GT, find best overlapping prediction
+    for gt in gt_gestures:
+        if gt.gesture_type not in gesture_types:
+            continue
+        
+        best_pred = None
+        best_overlap = 0
+        best_pred_idx = -1
+        
+        for idx, pred in enumerate(pred_gestures):
+            if pred.gesture_type not in gesture_types:
+                continue
+            if has_temporal_overlap(gt, pred):
+                overlap = compute_overlap_duration(gt, pred)
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_pred = pred
+                    best_pred_idx = idx
+        
+        if best_pred is not None:
+            confusion[gt.gesture_type][best_pred.gesture_type] += 1
+            matched_preds.add(best_pred_idx)
+        else:
+            confusion['missed'] += 1
+    
+    # Count false alarms (predictions with no GT match)
+    for idx, pred in enumerate(pred_gestures):
+        if pred.gesture_type not in gesture_types:
+            continue
+        if idx not in matched_preds:
+            confusion['false_alarm'][pred.gesture_type] += 1
+    
+    return confusion
+
+
+def evaluate_video(gt_path: str, gesture_dir: str, video_id: str, 
+                   min_confidence: float = 0.0) -> Tuple[Dict[str, EvaluationResult], 
                                                          List[GestureInstance], 
                                                          List[GestureInstance]]:
     """
@@ -284,6 +467,7 @@ def evaluate_video(gt_path: str, gesture_dir: str, video_id: str) -> Tuple[Dict[
         gt_path: Path to GT annotation file
         gesture_dir: Directory containing generated gesture files
         video_id: Video ID
+        min_confidence: Minimum confidence threshold for predictions
     
     Returns:
         Tuple of (results dict, gt_gestures list, pred_gestures list)
@@ -291,8 +475,10 @@ def evaluate_video(gt_path: str, gesture_dir: str, video_id: str) -> Tuple[Dict[
     # Load GT
     gt_gestures = load_gt_annotations_event_format(gt_path)
     
-    # Load predictions
+    # Load predictions and filter by confidence
     pred_gestures = load_generated_gestures(gesture_dir, video_id)
+    if min_confidence > 0:
+        pred_gestures = [g for g in pred_gestures if g.confidence >= min_confidence]
     
     # Match and evaluate using simple overlap
     results = match_gestures_overlap(gt_gestures, pred_gestures)
@@ -397,6 +583,12 @@ def main():
                         help='Video ID(s) to evaluate, comma-separated. If not provided, evaluates all.')
     parser.add_argument('--verbose', action='store_true',
                         help='Print detailed gesture lists')
+    parser.add_argument('--min_confidence', type=float, default=0.0,
+                        help='Minimum confidence threshold for predictions (e.g., 0.8, 0.9)')
+    parser.add_argument('--quiet', '-q', action='store_true',
+                        help='Only print final aggregated results (suppress per-video output)')
+    parser.add_argument('-w', '--window', action='store_true',
+                        help='Enable per-time-window analysis (0-40s, 40-80s, 80-120s within each segment)')
     
     args = parser.parse_args()
     
@@ -417,21 +609,53 @@ def main():
     
     # Aggregate results
     all_results = defaultdict(lambda: EvaluationResult(gesture_type=''))
+    gesture_types = ['pointing', 'showing', 'giving', 'reaching']
+    all_confusion = {gt: {pred: 0 for pred in gesture_types} for gt in gesture_types}
+    all_confusion['missed'] = 0
+    all_confusion['false_alarm'] = {pred: 0 for pred in gesture_types}
     evaluated_count = 0
     
-    for video_id in video_ids:
+    # Per-window results (only used with -w flag)
+    window_results = {label: defaultdict(lambda: EvaluationResult(gesture_type='')) 
+                      for _, _, label in TIME_WINDOWS}
+    
+    import time
+    total_videos = len(video_ids)
+    start_time = time.time()
+    
+    for idx, video_id in enumerate(video_ids):
+        video_start = time.time()
         gt_path = find_matching_gt_file(args.gt_dir, video_id)
         
         if not gt_path:
             print(f"Warning: GT not found for {video_id}")
             continue
         
-        results, gt_gestures, pred_gestures = evaluate_video(
-            gt_path, args.gesture_dir, video_id
+        # Load GT
+        gt_gestures = load_gt_annotations_event_format(gt_path)
+        
+        # Load predictions with offsets for window analysis
+        pred_gestures, segment_offsets = load_generated_gestures(
+            args.gesture_dir, video_id, return_offsets=True
         )
         
-        print_evaluation_report(results, gt_gestures, pred_gestures, video_id)
+        if args.min_confidence > 0:
+            pred_gestures = [g for g in pred_gestures if g.confidence >= args.min_confidence]
+        
+        # Standard evaluation
+        results = match_gestures_overlap(gt_gestures, pred_gestures)
+        
+        if not args.quiet:
+            print_evaluation_report(results, gt_gestures, pred_gestures, video_id)
         evaluated_count += 1
+        
+        # Progress logging (every 50 videos or last one)
+        if (idx + 1) % 50 == 0 or (idx + 1) == total_videos:
+            elapsed = time.time() - start_time
+            video_time = time.time() - video_start
+            avg_time = elapsed / (idx + 1)
+            eta = avg_time * (total_videos - idx - 1)
+            print(f"Progress: {idx + 1}/{total_videos} videos | Elapsed: {elapsed:.1f}s | ETA: {eta:.1f}s | Avg: {avg_time:.2f}s/video", flush=True)
         
         if args.verbose:
             print("\nGT Gestures:")
@@ -442,18 +666,43 @@ def main():
             for g in pred_gestures[:10]:
                 print(f"  {g.gesture_type} @ {g.start_time:.1f}s-{g.end_time:.1f}s")
         
-        # Aggregate
+        # Aggregate per-type results
         for g_type, result in results.items():
             all_results[g_type].gesture_type = g_type
             all_results[g_type].true_positives += result.true_positives
             all_results[g_type].false_positives += result.false_positives
             all_results[g_type].false_negatives += result.false_negatives
             all_results[g_type].iou_sum += result.iou_sum
+        
+        # Aggregate confusion matrix
+        video_confusion = compute_confusion_matrix(gt_gestures, pred_gestures, gesture_types)
+        for gt_type in gesture_types:
+            for pred_type in gesture_types:
+                all_confusion[gt_type][pred_type] += video_confusion[gt_type][pred_type]
+        all_confusion['missed'] += video_confusion['missed']
+        for pred_type in gesture_types:
+            all_confusion['false_alarm'][pred_type] += video_confusion['false_alarm'][pred_type]
+        
+        # Per-window analysis (if enabled)
+        if args.window and segment_offsets:
+            for win_start, win_end, win_label in TIME_WINDOWS:
+                # Filter both GT and predictions by segment-local time window
+                gt_window = filter_gestures_by_window(gt_gestures, win_start, win_end, segment_offsets)
+                pred_window = filter_gestures_by_window(pred_gestures, win_start, win_end, segment_offsets)
+                
+                win_results = match_gestures_overlap(gt_window, pred_window)
+                for g_type, result in win_results.items():
+                    window_results[win_label][g_type].gesture_type = g_type
+                    window_results[win_label][g_type].true_positives += result.true_positives
+                    window_results[win_label][g_type].false_positives += result.false_positives
+                    window_results[win_label][g_type].false_negatives += result.false_negatives
+                    window_results[win_label][g_type].iou_sum += result.iou_sum
     
-    # Print overall summary if multiple videos
-    if evaluated_count > 1:
+    # Print overall summary (always print aggregate results)
+    if evaluated_count >= 1:
+        gesture_dir_name = os.path.basename(args.gesture_dir.rstrip('/'))
         print(f"\n{'='*70}")
-        print(f"AGGREGATE RESULTS ({evaluated_count} videos)")
+        print(f"[{gesture_dir_name}] AGGREGATE RESULTS ({evaluated_count} videos, min_confidence={args.min_confidence})")
         print(f"{'='*70}")
         print(f"\n{'Gesture Type':<15} {'TP':<5} {'FP':<5} {'FN':<5} {'Prec':<8} {'Rec':<8} {'F1':<8} {'AvgIoU':<8}")
         print(f"{'─'*70}")
@@ -479,7 +728,37 @@ def main():
         
         print(f"{'OVERALL':<15} {total_tp:<5} {total_fp:<5} {total_fn:<5} "
               f"{overall_prec:.4f}  {overall_rec:.4f}  {overall_f1:.4f}  {overall_avg_iou:.4f}")
+        
+        # Print per-window results if enabled
+        if args.window:
+            print(f"\n{'='*70}")
+            print(f"PER-WINDOW ANALYSIS (segment-local time)")
+            print(f"{'='*70}")
+            
+            for win_start, win_end, win_label in TIME_WINDOWS:
+                print(f"\n--- Window: {win_label} ---")
+                print(f"{'Gesture Type':<15} {'TP':<5} {'FP':<5} {'FN':<5} {'Prec':<8} {'Rec':<8} {'F1':<8}")
+                print(f"{'─'*60}")
+                
+                win_total_tp, win_total_fp, win_total_fn = 0, 0, 0
+                
+                for g_type in ['pointing', 'showing', 'giving', 'reaching']:
+                    if g_type in window_results[win_label]:
+                        r = window_results[win_label][g_type]
+                        print(f"{g_type:<15} {r.true_positives:<5} {r.false_positives:<5} {r.false_negatives:<5} "
+                              f"{r.precision:.4f}  {r.recall:.4f}  {r.f1:.4f}")
+                        win_total_tp += r.true_positives
+                        win_total_fp += r.false_positives
+                        win_total_fn += r.false_negatives
+                
+                print(f"{'─'*60}")
+                win_prec = win_total_tp / (win_total_tp + win_total_fp) if (win_total_tp + win_total_fp) > 0 else 0
+                win_rec = win_total_tp / (win_total_tp + win_total_fn) if (win_total_tp + win_total_fn) > 0 else 0
+                win_f1 = 2 * win_prec * win_rec / (win_prec + win_rec) if (win_prec + win_rec) > 0 else 0
+                print(f"{'WINDOW TOTAL':<15} {win_total_tp:<5} {win_total_fp:<5} {win_total_fn:<5} "
+                      f"{win_prec:.4f}  {win_rec:.4f}  {win_f1:.4f}")
 
 
 if __name__ == '__main__':
     main()
+
