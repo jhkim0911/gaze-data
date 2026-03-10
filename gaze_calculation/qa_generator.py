@@ -138,7 +138,13 @@ You will receive structured event annotations detected in a video clip. Your job
    - State facts only — no interpretation, no hedging, no speculation.
    - Open-ended is ONLY for categories: T6, G5, C3, C4. All other categories MUST be MCQ.
 
-6. OUTPUT FORMAT:
+6. REASONING:
+   - Every QA must include a "reasoning" field with step-by-step process.
+   - Format: "<think> step-by-step reasoning here </think>"
+   - Explain: which event(s) you used, how you derived the answer, why distractors are wrong (MCQ) or what facts the answer covers (open-ended).
+   - This is for training data quality — the reasoning is NOT shown to the Video-LLM.
+
+7. OUTPUT FORMAT:
    Return ONLY a JSON array. No explanation, no markdown, no commentary.
    Each element:
    {
@@ -149,6 +155,7 @@ You will receive structured event annotations detected in a video clip. Your job
      "options": ["A) ...", "B) ...", "C) ...", "D) ..."],
      "answer": "C",
      "answer_text": "Person 3",
+     "reasoning": "<think> Used mutual_gaze event 4000 (P1,P3, 13.0-15.5s). At 14.0s P1 is looking at P3. Distractors: P0, P2 are other persons in video, 'no one' is implausible given mutual_gaze. </think>",
      "source_event_ids": [4000],
      "time_range": [13.0, 15.5]
    }
@@ -247,24 +254,18 @@ T4 (Mutual Gaze Recognition):
 
 [HARD — multi-step reasoning, multi-event aggregation]
 
-T5 (Gaze Following & Social Influence) [MCQ]:
+T5 (Gaze Following & Social Influence):
   "Who looks first at the target?" / "Is the gaze-following one-directional?"
   GT: gaze_following leader_id, follower_id. Distractors: swap roles.
-  Format: MCQ only.
   ONLY generate if gaze_following events exist.{t5_note}
 
-T6 (Group Attention Dynamics) [OPEN-ENDED]:
-  "Describe the group's attention pattern between Ts and Te."
-  "What happens to the group's attention after the shared focus ends at Ts?"
+T6 (Group Attention Dynamics):
+  "Who is NOT part of the shared attention?" / "What happens after the group attention ends?"
   GT: joint_attention/attention_capture persons_involved, event timeline.
-  Format: open_ended only. Answer = 2-4 sentences describing who shares attention, who is excluded, and what happens next.
   ONLY generate if joint_attention or attention_capture events exist.{t6_note}
 
-=== DIFFICULTY MIX ===
-- 1-2 Easy (T1, T2) — MCQ
-- 2-3 Medium (T3, T4) — MCQ
-- 1-2 Hard (T5: MCQ, T6: open_ended)
-ALL categories except T6 must be MCQ. T6 must be open_ended.
+=== FORMAT ===
+ALL questions must be MCQ. No open_ended in this prompt.
 
 === NOW GENERATE ===
 
@@ -360,26 +361,20 @@ G4 (Gesture Frequency & Distribution):
 
 [HARD — cross-gesture chaining or bidirectional reasoning]
 
-G5 (Gesture Sequence Chains) [OPEN-ENDED]:
-  "Describe the sequence of gestures involving Person X between Ts and Te."
-  "Trace the object transfer chain starting from Person X's gesture at Ts."
+G5 (Gesture Sequence Chains):
+  "P1 gives to P4, then P4 shows to someone. Who?" / "What gesture follows X?"
   GT: temporal sequence + participant tracking across gestures.
-  Format: open_ended only. Answer = 2-4 sentences describing the gesture chain with person IDs and timestamps.
   ONLY generate if 2+ person-to-person gestures share a participant.{g5_note}
 
-G6 (Reciprocal Gesture Patterns) [MCQ]:
+G6 (Reciprocal Gesture Patterns):
   "P3 points at P4. Does P4 gesture back toward P3?"
   GT: cross-reference initiator<->target across events.
-  Format: MCQ only.
   ONLY generate if 2+ person-to-person gestures involve overlapping participant pairs.{g6_note}
 
 IMPORTANT: "target_description" is context only. NEVER use as answer.
 
-=== DIFFICULTY MIX ===
-- 1-2 Easy (G1, G2) — MCQ
-- 1-2 Medium (G3, G4) — MCQ
-- 1-2 Hard (G5: open_ended, G6: MCQ)
-ALL categories except G5 must be MCQ. G5 must be open_ended.
+=== FORMAT ===
+ALL questions must be MCQ. No open_ended in this prompt.
 
 === NOW GENERATE ===
 
@@ -426,22 +421,131 @@ C2 (Eye Contact During Interaction):
 
 [HARD — causal/response chain or person-level integration]
 
-C3 (Gaze Response to Gesture) [OPEN-ENDED]:
-  "Describe how the group's gaze changes after Person X points at Person Y at Ts."
-  "What happens across gaze and gesture around the Ts-Te window?"
+C3 (Gaze Response to Gesture):
+  "After Person X points at Person Y, do others shift their gaze?"
+  "What gesture happens right after the group attention event ends?"
   GT: gesture end_time -> nearby gaze event (or vice versa), participant match.
-  Format: open_ended only. Answer = 2-4 sentences describing the causal chain across modalities with person IDs and timestamps.
+
+C4 (Cross-Modal Person Dynamics):
+  "Person X points at Person Y. Is Person Y involved in any gaze event at that time?"
+  "Who appears in the most events across both gaze and gesture data?"
+  GT: person presence check across both modalities.
+
+=== FORMAT ===
+ALL questions must be MCQ. No open_ended in this prompt.
+
+=== NOW GENERATE ===
+
+VIDEO METADATA:
+- video_id: {metadata['video_id']}
+- dataset: {metadata['dataset']}
+- persons_in_video: {metadata['person_ids']}
+- video_duration: {metadata['duration']}s
+
+GAZE EVENTS:
+{json.dumps(gaze_events, indent=2)}
+
+GESTURE EVENTS:
+{json.dumps(gesture_events, indent=2)}
+
+Generate the QA pairs now. Return ONLY the JSON array."""
+
+
+def _build_prompt_b_oe(metadata: dict, gaze_events: list) -> str:
+    """Prompt B-OE: Open-ended T6 only from gaze events -> 1-2 QA."""
+    return f"""{MASTER_SYSTEM_PROMPT}
+
+TASK: Generate 1-2 OPEN-ENDED QA pairs about group attention dynamics (T6).
+
+=== CATEGORY ===
+
+T6 (Group Attention Dynamics) [OPEN-ENDED]:
+  Ask the model to DESCRIBE the group's attention structure — who shares attention, who is excluded, and what changes over time.
+  Example questions:
+    "Describe the group's attention pattern from Ts to Te."
+    "What happens to the group's gaze after the shared focus ends at Ts?"
+  GT: joint_attention/attention_capture persons_involved, event timeline.
+  Answer: 2-4 sentences describing observable facts with Person IDs and timestamps.
+
+=== FORMAT ===
+ALL questions must be open_ended. No MCQ in this prompt.
+
+=== NOW GENERATE ===
+
+VIDEO METADATA:
+- video_id: {metadata['video_id']}
+- dataset: {metadata['dataset']}
+- persons_in_video: {metadata['person_ids']}
+- video_duration: {metadata['duration']}s
+
+GAZE EVENTS:
+{json.dumps(gaze_events, indent=2)}
+
+Generate the QA pairs now. Return ONLY the JSON array."""
+
+
+def _build_prompt_d_oe(metadata: dict, gesture_events: list) -> str:
+    """Prompt D-OE: Open-ended G5 only from gesture events -> 1-2 QA."""
+    return f"""{MASTER_SYSTEM_PROMPT}
+
+TASK: Generate 1-2 OPEN-ENDED QA pairs about gesture sequence chains (G5).
+
+=== CATEGORY ===
+
+G5 (Gesture Sequence Chains) [OPEN-ENDED]:
+  Ask the model to DESCRIBE a sequence of gestures involving shared participants — object transfer chains, action sequences.
+  Example questions:
+    "Describe the sequence of gestures involving Person X from Ts to Te."
+    "Trace the object transfer chain starting from Person X's gesture at Ts."
+  GT: temporal sequence + participant tracking across gestures.
+  Answer: 2-4 sentences describing the gesture chain with Person IDs and timestamps.
+
+IMPORTANT: "target_description" is context only. NEVER use as answer.
+
+=== FORMAT ===
+ALL questions must be open_ended. No MCQ in this prompt.
+
+=== NOW GENERATE ===
+
+VIDEO METADATA:
+- video_id: {metadata['video_id']}
+- dataset: {metadata['dataset']}
+- persons_in_video: {metadata['person_ids']}
+- video_duration: {metadata['duration']}s
+
+GESTURE ANNOTATIONS:
+{json.dumps(gesture_events, indent=2)}
+
+Generate the QA pairs now. Return ONLY the JSON array."""
+
+
+def _build_prompt_e_oe(metadata: dict, gaze_events: list, gesture_events: list) -> str:
+    """Prompt E-OE: Open-ended C3, C4 only from cross-modal data -> 2-3 QA."""
+    return f"""{MASTER_SYSTEM_PROMPT}
+
+TASK: Generate 2-3 OPEN-ENDED cross-modal QA pairs (C3, C4).
+Every question MUST require information from BOTH gaze and gesture data.
+
+=== CATEGORIES ===
+
+C3 (Gaze Response to Gesture) [OPEN-ENDED]:
+  Ask the model to DESCRIBE the causal chain between gesture and gaze response.
+  Example questions:
+    "Describe how the group's gaze changes after Person X points at Person Y at Ts."
+    "What happens across gaze and gesture around the Ts-Te window?"
+  GT: gesture end_time -> nearby gaze event, participant match.
+  Answer: 2-4 sentences describing the cross-modal causal chain.
 
 C4 (Cross-Modal Person Dynamics) [OPEN-ENDED]:
-  "Describe Person X's role in both gaze and gesture interactions in this clip."
-  "How do gaze and gesture interactions relate around Ts?"
+  Ask the model to DESCRIBE a person's role across both modalities.
+  Example questions:
+    "Describe Person X's involvement in both gaze and gesture interactions."
+    "How do gaze and gesture interactions relate around Ts?"
   GT: person presence check across both modalities.
-  Format: open_ended only. Answer = 2-4 sentences integrating person's gaze and gesture behavior with timestamps.
+  Answer: 2-4 sentences integrating gaze and gesture behavior.
 
-=== DIFFICULTY MIX ===
-- 1-2 Medium (C1, C2) — MCQ
-- 2-3 Hard (C3, C4) — open_ended
-C1 and C2 must be MCQ. C3 and C4 must be open_ended.
+=== FORMAT ===
+ALL questions must be open_ended. No MCQ in this prompt.
 
 === NOW GENERATE ===
 
@@ -559,6 +663,10 @@ def select_prompts(
             prompts.append(("prompt_A", _build_prompt_a(metadata, gaze_clean)))
         else:
             prompts.append(("prompt_B", _build_prompt_b(metadata, gaze_clean)))
+            # T6 open-ended (separate call) — only if joint_attention or attention_capture exist
+            event_types = {e["event_type"] for e in gaze_clean}
+            if event_types & {"joint_attention", "attention_capture"}:
+                prompts.append(("prompt_B_OE", _build_prompt_b_oe(metadata, gaze_clean)))
 
     # Gesture prompts
     if len(gesture_clean) > 0:
@@ -566,10 +674,17 @@ def select_prompts(
             prompts.append(("prompt_C", _build_prompt_c(metadata, gesture_clean)))
         else:
             prompts.append(("prompt_D", _build_prompt_d(metadata, gesture_clean)))
+            # G5 open-ended (separate call) — only if 2+ person-to-person gestures share a participant
+            p2p = [g for g in gesture_clean
+                   if g.get("target_type") == "person" and g.get("target_person_id") is not None]
+            if len(p2p) >= 2:
+                prompts.append(("prompt_D_OE", _build_prompt_d_oe(metadata, gesture_clean)))
 
     # Cross-modal prompt
     if len(gaze_clean) > 0 and len(gesture_clean) > 0 and len(cross_pairs) >= 2:
         prompts.append(("prompt_E", _build_prompt_e(metadata, gaze_clean, gesture_clean)))
+        # C3/C4 open-ended (separate call)
+        prompts.append(("prompt_E_OE", _build_prompt_e_oe(metadata, gaze_clean, gesture_clean)))
 
     return prompts
 
@@ -580,8 +695,13 @@ def select_prompts(
 
 def validate_qa(
     qa_pairs: list, person_ids: list, mode: str,
+    expected_format: str = "mcq",
 ) -> list:
-    """Validate generated QA pairs. mode = 'gaze' | 'gesture' | 'cross'."""
+    """Validate generated QA pairs.
+
+    mode = 'gaze' | 'gesture' | 'cross'
+    expected_format = 'mcq' | 'open_ended'
+    """
     valid = []
     seen_questions = []
 
@@ -589,21 +709,13 @@ def validate_qa(
         if not isinstance(qa, dict):
             continue
 
-        # Enforce format per category
         cat = qa.get("category", "")
-        fmt = qa.get("format", "")
 
-        if cat in OPEN_ENDED_CATEGORIES:
-            # Must be open_ended; coerce if model used wrong format
-            if fmt != "open_ended":
-                fmt = "open_ended"
-                qa["format"] = "open_ended"
-                qa.pop("options", None)
-        else:
-            # Must be MCQ
-            if fmt != "mcq":
-                fmt = "mcq"
-                qa["format"] = "mcq"
+        # Enforce the expected format from the prompt call
+        fmt = expected_format
+        qa["format"] = fmt
+        if fmt == "open_ended":
+            qa.pop("options", None)
 
         # Format-specific checks
         if fmt == "mcq":
@@ -777,16 +889,23 @@ class QAGenerator:
         all_qa = []
         prompt_calls = []
 
+        PROMPT_CONFIG = {
+            "prompt_A":    ("gaze",    "mcq"),
+            "prompt_B":    ("gaze",    "mcq"),
+            "prompt_B_OE": ("gaze",    "open_ended"),
+            "prompt_C":    ("gesture", "mcq"),
+            "prompt_D":    ("gesture", "mcq"),
+            "prompt_D_OE": ("gesture", "open_ended"),
+            "prompt_E":    ("cross",   "mcq"),
+            "prompt_E_OE": ("cross",   "open_ended"),
+        }
+
         for prompt_name, prompt_text in prompts:
-            mode = {
-                "prompt_A": "gaze", "prompt_B": "gaze",
-                "prompt_C": "gesture", "prompt_D": "gesture",
-                "prompt_E": "cross",
-            }[prompt_name]
+            mode, expected_format = PROMPT_CONFIG[prompt_name]
 
             try:
                 raw_qa = self._call_gemini(prompt_text)
-                validated = validate_qa(raw_qa, person_ids, mode)
+                validated = validate_qa(raw_qa, person_ids, mode, expected_format)
 
                 # Tag each QA with video info
                 for qa in validated:
