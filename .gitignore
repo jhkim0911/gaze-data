@@ -4,3 +4,10 @@ data_results/
 __pycache__/
 *.pyc
 .env
+CLAUDE.md
+run.sh
+mmsi.sh
+docs/*.md
+examples/
+visualization/
+.claude/
