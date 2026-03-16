@@ -8,7 +8,7 @@ time_range with random 1-3s buffer (snapped to 2fps).
 Input:
   {dataset}/qa_data/{video}_qa.json       (train, root level)
   {dataset}/qa_data/test/{video}_qa.json  (test split)
-  {dataset}/bbox_videos/{video}_bbox_viz.mp4
+  {dataset}/bb_video/{video}_bbox_viz.mp4
 
 Output:
   {dataset}/video_info/{video}_qa{idx:04d}.mp4
@@ -227,7 +227,7 @@ def process_dataset(
 ) -> Tuple[int, int, int]:
     """Process a dataset split. Returns (made, skipped, errors)."""
     qa_dir = os.path.join(base_dir, dataset, "qa_data")
-    video_dir = os.path.join(base_dir, dataset, "bbox_videos")
+    video_dir = os.path.join(base_dir, dataset, "bb_video")
 
     # Output dirs: train at root, test in test/ subdir
     if split == "train":

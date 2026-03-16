@@ -209,6 +209,7 @@ def process_single_video(
     reencode: bool = True,
     show_gaze: bool = False,
     show_bbox: bool = True,
+    show_info: bool = True,
 ) -> bool:
     """
     Process a single JSON annotation file and create bbox visualization.
@@ -310,12 +311,13 @@ def process_single_video(
             cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
             
             # Draw frame info overlay (timestamp, person count) - after blending so it's fully visible
-            timestamp = frame_data.get("timestamp", 0.0)
-            num_persons = len(frame_data.get("persons", []))
-            info_text = f"t={timestamp:.2f}s | {num_persons} person(s)"
-            (tw, th), _ = cv2.getTextSize(info_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-            cv2.rectangle(frame, (5, 5), (15 + tw, 35), (0, 0, 0), -1)
-            cv2.putText(frame, info_text, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+            if show_info:
+                timestamp = frame_data.get("timestamp", 0.0)
+                num_persons = len(frame_data.get("persons", []))
+                info_text = f"t={timestamp:.2f}s | {num_persons} person(s)"
+                (tw, th), _ = cv2.getTextSize(info_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+                cv2.rectangle(frame, (5, 5), (15 + tw, 35), (0, 0, 0), -1)
+                cv2.putText(frame, info_text, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
             
             out.write(frame)
         
@@ -370,6 +372,14 @@ def main():
         help="Skip H.264 re-encoding (faster but less compatible)"
     )
     parser.add_argument(
+        "--no_info", action="store_true",
+        help="Don't draw frame info overlay (timestamp, person count)"
+    )
+    parser.add_argument(
+        "--output_subdir", type=str, default=None,
+        help="Override output subdirectory name (default: auto based on flags)"
+    )
+    parser.add_argument(
         "--split", type=int, default=1,
         help="Total number of parallel splits (default: 1)"
     )
@@ -395,7 +405,9 @@ def main():
     
     # Determine output subdirectory based on options
     # Default: bbox_videos, --gaze: o_gaze_videos, --no_bbox: nbbox_videos
-    if args.no_bbox:
+    if args.output_subdir:
+        output_subdir = args.output_subdir
+    elif args.no_bbox:
         output_subdir = "nbbox_videos"
     elif args.gaze:
         output_subdir = "o_gaze_videos"
@@ -466,6 +478,7 @@ def main():
             reencode=not args.no_reencode,
             show_gaze=args.gaze,
             show_bbox=not args.no_bbox,
+            show_info=not args.no_info,
         )
         
         if success:
