@@ -6,7 +6,9 @@ __pycache__/
 .env
 CLAUDE.md
 run.sh
-mmsi.sh
+mmsi*
+tmp_*
+**/tmp_*
 docs/*.md
 examples/
 visualization/
