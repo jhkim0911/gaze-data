@@ -76,7 +76,7 @@ def clip_video(input_path: str, output_path: str, start: float, end: float) -> b
         output_path,
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         return result.returncode == 0
     except Exception:
         return False
