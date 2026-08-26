@@ -98,6 +98,34 @@ def adjust_timestamps_in_text(text: str, offset: float) -> str:
     )
 
 
+_DURATION_QUESTION_RE = re.compile(
+    r"\b(?:how\s+(?:much\s+time|long)|time\s+passes|elapsed|delay|duration)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_duration_question(question: str) -> bool:
+    """Return True when numeric MCQ options denote durations, not timestamps.
+
+    The legacy clip builder subtracted ``clip_offset`` from every number followed
+    by "seconds".  That is correct for absolute event timestamps but corrupts a
+    duration such as ``1.5 seconds`` into ``0.0 seconds``.  Duration questions
+    keep their option values unchanged; timestamps in the question itself are
+    still converted to clip-local time.
+    """
+    return bool(_DURATION_QUESTION_RE.search(question or ""))
+
+
+def _selected_option_text(options, answer: str):
+    """Return the selected option without its leading ``A)`` label."""
+    letter = str(answer or "").strip().upper()
+    for option in options or []:
+        text = str(option).strip()
+        if text.upper().startswith(f"{letter})"):
+            return re.sub(r"^[A-D]\)\s*", "", text).strip()
+    return None
+
+
 def process_qa_file(
     qa_path: str,
     video_dir: str,
@@ -177,9 +205,22 @@ def process_qa_file(
             if "answer" in qa:
                 adj["answer"] = adjust_timestamps_in_text(qa["answer"], offset)
         if "options" in qa:
-            adj["options"] = [
-                adjust_timestamps_in_text(o, offset) for o in qa["options"]
-            ]
+            # Duration values are invariant to clip offset.  Absolute event
+            # timestamps still need the normal segment->clip conversion.
+            if qa.get("format") == "mcq" and _is_duration_question(qa.get("question", "")):
+                adj["options"] = list(qa["options"])
+            else:
+                adj["options"] = [
+                    adjust_timestamps_in_text(o, offset) for o in qa["options"]
+                ]
+
+            # Keep the redundant human-readable answer synchronized with the
+            # transformed correct option.  The old builder adjusted options but
+            # left MCQ answer_text in segment time, creating false mismatches.
+            if qa.get("format") == "mcq":
+                selected = _selected_option_text(adj["options"], qa.get("answer"))
+                if selected is not None:
+                    adj["answer_text"] = selected
 
         final_qa = {
             "video_name": video_name,

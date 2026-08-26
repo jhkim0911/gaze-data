@@ -13,3 +13,44 @@ docs/*.md
 examples/
 visualization/
 .claude/
+
+# Local agent/session state and conversation exports (never publish)
+.codex/
+.agents/
+AGENTS.md
+_workspace/
+chat_exports/
+conversation_exports/
+*pasted-text*.txt
+*conversation*.txt
+*conversation*.md
+*.output
+
+# Generated diagnostics, contact sheets, and local visual comparisons
+.codex_diag/
+.codex_video_compare/
+local/
+diag/
+**/diag/
+diagnostics/
+**/diagnostics/
+contact_sheets/
+**/contact_sheets/
+/source_video_hours.json
+
+# Internal data/annotation tooling — local-only until an explicit release
+gaze_annotation/sam3_retinaface_only.py
+gaze_calculation/audit_childplay_native.py
+gaze_calculation/audit_childplay_release_archive.py
+gaze_calculation/audit_social_gesture_release_b.py
+gaze_calculation/build_h2a_multi_manifest.py
+gaze_calculation/build_release_b_slow_overlays.py
+gaze_calculation/convert_rich_to_sft.py
+gaze_calculation/enrich_sft_reasoning.py
+gaze_calculation/enrich_sft_reasoning_v2.py
+gaze_calculation/make_nobbox_clips.py
+gaze_calculation/make_release_b_overlay_contact_sheet.py
+gaze_calculation/reaudit_refined_person_partition.py
+gaze_calculation/refine_persons/
+gaze_calculation/repair_grasp_qa_openai.py
+gaze_calculation/shuffle_mcq_options.py

@@ -1130,6 +1130,7 @@ def visualize_annotations(
     show_head_bbox: bool = True,
     show_gaze: bool = True,
     progress_bar: bool = True,
+    show_frame_info: bool = True,
 ) -> None:
     """Create visualization video with annotations overlaid."""
     cap = cv2.VideoCapture(video_path)
@@ -1199,12 +1200,12 @@ def visualize_annotations(
                     elif inout is False:
                         cv2.putText(frame, "OUT", (fcx - 20, fcy + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, out_color, 2, cv2.LINE_AA)
         
-        # Frame info
-        info_text = f"Frame: {frame_idx} | t={frame_data['timestamp']:.2f}s | {len(frame_data['persons'])} person(s)"
-        (tw, th), _ = cv2.getTextSize(info_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
-        cv2.rectangle(frame, (5, 5), (15 + tw, 35), (0, 0, 0), -1)
-        cv2.putText(frame, info_text, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-        
+        if show_frame_info:
+            info_text = f"Frame: {frame_idx} | t={frame_data['timestamp']:.2f}s | {len(frame_data['persons'])} person(s)"
+            (tw, th), _ = cv2.getTextSize(info_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+            cv2.rectangle(frame, (5, 5), (15 + tw, 35), (0, 0, 0), -1)
+            cv2.putText(frame, info_text, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+
         out.write(frame)
     
     cap.release()
@@ -1309,7 +1310,7 @@ def main():
         sam3_confidence=args.sam3_confidence,
         face_det_thresh=args.face_det_thresh,
     )
-    
+
     # Process video
     print(f"\nProcessing: {args.video_path}")
     results = annotator.annotate_video(

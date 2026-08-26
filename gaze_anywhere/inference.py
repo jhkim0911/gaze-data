@@ -174,7 +174,8 @@ class GazePredictor:
 
         # Process outputs (convert to float32 first for numpy compatibility)
         heatmap = gaze_heatmap.squeeze().cpu().float().numpy()
-        inout = inout_pred.cpu().float().item() > 0.5
+        inout_score = inout_pred.cpu().float().item()   # 연속 score (AP 등 threshold-free 지표용)
+        inout = inout_score > 0.5
         bbox = bbox_pred.cpu().float().numpy()[0]  # (cx, cy, w, h) normalized
 
         # Extract gaze point
@@ -209,6 +210,7 @@ class GazePredictor:
             "gaze_point": (gaze_x_norm, gaze_y_norm),
             "gaze_point_px": (gaze_x_px, gaze_y_px),
             "inout": inout,
+            "inout_score": inout_score,
             "head_bbox": bbox_xyxy_norm,
             "head_bbox_px": bbox_xyxy_px,
             "heatmap": heatmap,

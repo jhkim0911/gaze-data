@@ -380,6 +380,11 @@ def main():
         help="Override output subdirectory name (default: auto based on flags)"
     )
     parser.add_argument(
+        "--input_subdir", type=str, default=None,
+        help="Override input subdirectory name (default: dataset's gaze_videos). "
+             "e.g. gaze_videos_5fps for a higher-fps re-render."
+    )
+    parser.add_argument(
         "--split", type=int, default=1,
         help="Total number of parallel splits (default: 1)"
     )
@@ -419,7 +424,10 @@ def main():
     # Collect all JSON files
     all_json_files = []
     for ds_name in datasets_to_process:
-        input_dir = DATASETS[ds_name]["input"]
+        if args.input_subdir:
+            input_dir = os.path.join(BASE_PATH, ds_name, args.input_subdir)
+        else:
+            input_dir = DATASETS[ds_name]["input"]
         # Construct output_dir from base path + dataset + output_subdir
         output_dir = os.path.join(BASE_PATH, ds_name, output_subdir)
         

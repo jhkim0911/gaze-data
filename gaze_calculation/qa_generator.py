@@ -61,16 +61,16 @@ DATASETS = [
 DEFAULT_BASE_PATH = "/projects/illinois/eng/cs/jrehg/users/arkimjh/gaze_social"
 
 CATEGORY_DIFFICULTY = {
-    "T1": "easy", "T2": "easy", "T3": "medium", "T4": "medium",
-    "T5": "hard", "T6": "hard",
-    "G1": "easy", "G2": "easy", "G3": "medium", "G4": "medium",
-    "G5": "hard", "G6": "hard",
-    "C1": "medium", "C2": "medium", "C3": "hard", "C4": "hard",
+    "T1": "easy", "T2": "easy", "T5": "hard", "T3": "medium",
+    "T4": "medium", "T6": "hard",
+    "G1": "easy", "G2": "easy", "G3": "medium", "G5": "hard",
+    "G6": "hard", "G4": "medium",
+    "C1": "medium", "C3": "hard", "C2": "medium", "C4": "hard",
 }
 
 # Categories that use open-ended format (multi-event synthesis / narrative)
 # All other categories use MCQ only
-OPEN_ENDED_CATEGORIES = {"T6", "G5", "C3", "C4"}
+OPEN_ENDED_CATEGORIES = {"T6", "G6", "C2", "C4"}
 
 BANNED_WORDS = [
     "suggesting", "indicating", "likely", "because",
@@ -136,7 +136,7 @@ You will receive structured event annotations detected in a video clip. Your job
    - No options field.
    - Answer must be 2-4 sentences describing observable facts grounded in event timestamps and person IDs.
    - State facts only — no interpretation, no hedging, no speculation.
-   - Open-ended is ONLY for categories: T6, G5, C3, C4. All other categories MUST be MCQ.
+   - Open-ended is ONLY for categories: T6, G6, C2, C4. All other categories MUST be MCQ.
 
 6. REASONING:
    - Every QA must include a "reasoning" field with step-by-step process.
@@ -214,7 +214,7 @@ def _build_prompt_b(metadata: dict, gaze_events: list) -> str:
     has_t5 = "gaze_following" in event_types
     has_t6 = bool(event_types & {"joint_attention", "attention_capture"})
 
-    t5_note = "" if has_t5 else "\n  NOTE: No gaze_following events — SKIP T5."
+    t5_note = "" if has_t5 else "\n  NOTE: No gaze_following events — SKIP T4."
     t6_note = "" if has_t6 else "\n  NOTE: No joint_attention/attention_capture — SKIP T6."
 
     return f"""{MASTER_SYSTEM_PROMPT}
@@ -242,19 +242,19 @@ T2 (Gaze Event Classification):
 
 [MEDIUM — cross-event comparison or bidirectional reasoning]
 
-T3 (Temporal Gaze Reasoning):
+T5 (Temporal Gaze Reasoning):
   Duration: "How long do Person X and Person Y maintain eye contact?"
   Ordering: "Between Person X and Person Y, which gaze event happens first: eye contact or gaze following?"
   IMPORTANT: Always scope to a specific person pair. Never ask "which happens first" across all events.
   GT: start_time, end_time, duration. Distractors: swapped order, wrong durations.
 
-T4 (Mutual Gaze Recognition):
+T3 (Mutual Gaze Recognition):
   "Which pair of people makes eye contact?"
   GT: mutual_gaze persons_involved (exactly 2). Distractors: other possible pairs.
 
 [HARD — multi-step reasoning, multi-event aggregation]
 
-T5 (Gaze Following & Social Influence):
+T4 (Gaze Following & Social Influence):
   "Who looks first at the target?" / "Is the gaze-following one-directional?"
   GT: gaze_following leader_id, follower_id. Distractors: swap roles.
   ONLY generate if gaze_following events exist.{t5_note}
@@ -324,13 +324,13 @@ Generate the QA pairs now. Return ONLY the JSON array."""
 
 def _build_prompt_d(metadata: dict, gesture_events: list) -> str:
     """Prompt D: Full gesture (4+ gestures -> G1-G6) -> 4-7 QA."""
-    # Check if G5/G6 are feasible
+    # Check if G4/G6 are feasible
     p2p = [g for g in gesture_events
            if g.get("target_type") == "person" and g.get("target_person_id") is not None]
     has_g5_g6 = len(p2p) >= 2
 
-    g5_note = "" if has_g5_g6 else "\n  NOTE: Not enough person-to-person gestures — SKIP G5."
-    g6_note = "" if has_g5_g6 else "\n  NOTE: Not enough person-to-person gestures — SKIP G6."
+    g5_note = "" if has_g5_g6 else "\n  NOTE: Not enough person-to-person gestures — SKIP G6."
+    g6_note = "" if has_g5_g6 else "\n  NOTE: Not enough person-to-person gestures — SKIP G4."
 
     return f"""{MASTER_SYSTEM_PROMPT}
 
@@ -355,18 +355,18 @@ G3 (Gesture Temporal Reasoning):
   "Which happens first: X or Y?" / "How long does the gesture last?"
   GT: start_time, end_time comparison.
 
-G4 (Gesture Frequency & Distribution):
+G5 (Gesture Frequency & Distribution):
   "Who performs the most gestures?" / "What is the most common gesture type?"
   GT: count by initiator_id or gesture_type -> argmax.
 
 [HARD — cross-gesture chaining or bidirectional reasoning]
 
-G5 (Gesture Sequence Chains):
+G6 (Gesture Sequence Chains):
   "P1 gives to P4, then P4 shows to someone. Who?" / "What gesture follows X?"
   GT: temporal sequence + participant tracking across gestures.
   ONLY generate if 2+ person-to-person gestures share a participant.{g5_note}
 
-G6 (Reciprocal Gesture Patterns):
+G4 (Reciprocal Gesture Patterns):
   "P3 points at P4. Does P4 gesture back toward P3?"
   GT: cross-reference initiator<->target across events.
   ONLY generate if 2+ person-to-person gestures involve overlapping participant pairs.{g6_note}
@@ -415,13 +415,13 @@ C1 (Gaze-Gesture Temporal Alignment):
   "Which happens first: the gaze shift or the reaching gesture?"
   GT: timestamp comparison across gaze_events and gesture_events.
 
-C2 (Eye Contact During Interaction):
+C3 (Eye Contact During Interaction):
   "When Person X gives something to Person Y, are they making eye contact?"
   GT: mutual_gaze overlapping with giving/showing + same participant pair.
 
 [HARD — causal/response chain or person-level integration]
 
-C3 (Gaze Response to Gesture):
+C2 (Gaze Response to Gesture):
   "After Person X points at Person Y, do others shift their gaze?"
   "What gesture happens right after the group attention event ends?"
   GT: gesture end_time -> nearby gaze event (or vice versa), participant match.
@@ -485,14 +485,14 @@ Generate the QA pairs now. Return ONLY the JSON array."""
 
 
 def _build_prompt_d_oe(metadata: dict, gesture_events: list) -> str:
-    """Prompt D-OE: Open-ended G5 only from gesture events -> 1-2 QA."""
+    """Prompt D-OE: Open-ended G6 only from gesture events -> 1-2 QA."""
     return f"""{MASTER_SYSTEM_PROMPT}
 
-TASK: Generate 1-2 OPEN-ENDED QA pairs about gesture sequence chains (G5).
+TASK: Generate 1-2 OPEN-ENDED QA pairs about gesture sequence chains (G6).
 
 === CATEGORY ===
 
-G5 (Gesture Sequence Chains) [OPEN-ENDED]:
+G6 (Gesture Sequence Chains) [OPEN-ENDED]:
   Ask the model to DESCRIBE a sequence of gestures involving shared participants — object transfer chains, action sequences.
   Example questions:
     "Describe the sequence of gestures involving Person X from Ts to Te."
@@ -520,15 +520,15 @@ Generate the QA pairs now. Return ONLY the JSON array."""
 
 
 def _build_prompt_e_oe(metadata: dict, gaze_events: list, gesture_events: list) -> str:
-    """Prompt E-OE: Open-ended C3, C4 only from cross-modal data -> 2-3 QA."""
+    """Prompt E-OE: Open-ended C2, C4 only from cross-modal data -> 2-3 QA."""
     return f"""{MASTER_SYSTEM_PROMPT}
 
-TASK: Generate 2-3 OPEN-ENDED cross-modal QA pairs (C3, C4).
+TASK: Generate 2-3 OPEN-ENDED cross-modal QA pairs (C2, C4).
 Every question MUST require information from BOTH gaze and gesture data.
 
 === CATEGORIES ===
 
-C3 (Gaze Response to Gesture) [OPEN-ENDED]:
+C2 (Gaze Response to Gesture) [OPEN-ENDED]:
   Ask the model to DESCRIBE the causal chain between gesture and gaze response.
   Example questions:
     "Describe how the group's gaze changes after Person X points at Person Y at Ts."
@@ -674,7 +674,7 @@ def select_prompts(
             prompts.append(("prompt_C", _build_prompt_c(metadata, gesture_clean)))
         else:
             prompts.append(("prompt_D", _build_prompt_d(metadata, gesture_clean)))
-            # G5 open-ended (separate call) — only if 2+ person-to-person gestures share a participant
+            # G6 open-ended (separate call) — only if 2+ person-to-person gestures share a participant
             p2p = [g for g in gesture_clean
                    if g.get("target_type") == "person" and g.get("target_person_id") is not None]
             if len(p2p) >= 2:
@@ -683,7 +683,7 @@ def select_prompts(
     # Cross-modal prompt
     if len(gaze_clean) > 0 and len(gesture_clean) > 0 and len(cross_pairs) >= 2:
         prompts.append(("prompt_E", _build_prompt_e(metadata, gaze_clean, gesture_clean)))
-        # C3/C4 open-ended (separate call)
+        # C2/C4 open-ended (separate call)
         prompts.append(("prompt_E_OE", _build_prompt_e_oe(metadata, gaze_clean, gesture_clean)))
 
     return prompts
