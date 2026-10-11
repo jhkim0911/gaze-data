@@ -89,9 +89,22 @@ class GazePredictor:
         # Instantiate model
         self.model = instantiate(cfg.model)
 
-        # Load checkpoint
-        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        self.model.load_state_dict(checkpoint["model"])
+        # Load checkpoint (.pth = detectron2 {"model": sd} / .safetensors = HF 공개판, gaze_model. 프리픽스)
+        if checkpoint_path.endswith(".safetensors"):
+            from safetensors.torch import load_file
+            sd = load_file(checkpoint_path)
+            sd = {(k[len("gaze_model."):] if k.startswith("gaze_model.") else k): v for k, v in sd.items()}
+            # HF 공개판은 mapper qkv_bias=False로 학습 — bias 0 강제 = 수학적으로 동일 (그 외 키 1:1)
+            missing, unexpected = self.model.load_state_dict(sd, strict=False)
+            assert not unexpected, f"unexpected keys: {unexpected[:5]}"
+            assert all(k.endswith("attn.qkv.bias") for k in missing), f"non-bias missing: {missing[:5]}"
+            miss_set = set(missing)
+            for name, p in self.model.named_parameters():
+                if name in miss_set:
+                    p.data.zero_()
+        else:
+            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+            self.model.load_state_dict(checkpoint["model"])
 
         self.model = self.model.to(device)
         self.model.eval()
